@@ -1,27 +1,16 @@
 """
-応急危険度判定 mTSP - 時間制約付き複数巡回セールスマン問題
+応急危険度判定 mTSP - 時間制約付き複数巡回セールスマン問題 GUI
 Time-Constrained mTSP for Emergency Building Inspection
 
 【概要】
 地震等の災害後に複数の判定士が拠点（デポ）から出発し、
 エリア内の全建物を手分けして応急危険度判定を行う巡回計画を作成する。
 
-【アルゴリズム】
-- 最近傍法 (Nearest Neighbor) + KDTree による O(n log n) 近傍探索
-- min-heap によるラウンドロビン割当（makespan 最小化）
-- ProcessPoolExecutor による並列試行（複数デポ候補から最短を採用）
-- 最小判定士数は二分探索で O(log n) 回の試行で確定
-
-【制約条件】
-1. 各建物は1回だけ判定（visited フラグ）
-2. 判定士は拠点から出発・拠点に帰還
-3. 移動時間（距離 / 速度）を稼働時間に加算
-4. 判定時間（建物ごとに設定）を稼働時間に加算
-5. 現在時刻 + 移動 + 判定 + デポ帰還 ≤ 最大稼働時間 を満たす場合のみ割当
-6. 目的関数: 最大終了時間（makespan）の最小化
+ソルバー本体は mtsp_core モジュールに分離されており、本ファイルは
+GUI（tkinter + matplotlib）のみを担当する。
 
 【依存ライブラリ】
-    pip install ortools scipy matplotlib numpy
+    pip install scipy matplotlib numpy
 """
 
 import tkinter as tk
@@ -30,14 +19,15 @@ import threading
 import time
 import os
 import random
-import heapq
 import numpy as np
-from scipy.spatial import KDTree
 import matplotlib
 matplotlib.rcParams['font.family'] = 'Meiryo'
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from concurrent.futures import ProcessPoolExecutor, as_completed
+
+from mtsp_core import (
+    InspectionProblem, GreedySolver, MultiStartSolver, find_min_inspectors,
+)
 
 
 # 判定士ごとのルート描画色（最大20人分）
@@ -49,161 +39,6 @@ COLORS = [
 ]
 
 
-# ── コアアルゴリズム（ProcessPoolExecutor で並列実行するためトップレベルに定義）──
-
-def _mtsp_worker(args):
-    """
-    時間制約付き mTSP 貪欲法ワーカー。
-
-    【割当戦略】
-    min-heap で「現在時刻が最も小さい（最も暇な）判定士」が次の建物を選ぶ。
-    これにより各判定士の終了時刻が平準化され、makespan が最小化される。
-
-    【実行フロー】
-    1. 全判定士を時刻 0・デポ位置でヒープに積む
-    2. ヒープから最小時刻の判定士 s を取り出す
-    3. KDTree で現在地に近い未訪問建物を候補として取得
-    4. 制約チェック: t_now + 移動時間 + 判定時間 + デポ帰還時間 ≤ max_work_sec
-    5. 条件を満たす最近傍を割当 → ヒープに再投入
-    6. どの建物も割当不可なら担当者 s は終了（done フラグ）
-    7. 全担当者終了 or 全建物割当完了で終了
-
-    Args:
-        args: (coords_arr, inspect_times, depot_idx, m, area_km, speed_kmh, max_work_h)
-
-    Returns:
-        (makespan, total_dist, routes, per_time, per_dist, unassigned)
-        - makespan   : 最大終了時間 [時間]
-        - total_dist : 総移動距離 [km]
-        - routes     : 判定士ごとの訪問順インデックスリスト
-        - per_time   : 判定士ごとの稼働時間 [時間]
-        - per_dist   : 判定士ごとの移動距離 [km]
-        - unassigned : 時間不足で割当できなかった建物数
-    """
-    (coords_arr, inspect_times, depot_idx,
-     m, area_km, speed_kmh, max_work_h) = args
-
-    n = len(coords_arr)
-    max_work_sec = max_work_h * 3600.0        # 最大稼働時間を秒換算
-    speed_ms = speed_kmh * 1000 / 3600.0      # 移動速度を m/s 換算
-    area_m   = area_km * 1000.0               # エリアサイズを m 換算
-
-    def travel_sec(i, j):
-        """2点間の移動時間（秒）= ユークリッド距離 × エリアスケール / 速度"""
-        d = float(np.linalg.norm(coords_arr[i] - coords_arr[j]))
-        return d * area_m / speed_ms
-
-    # KDTree を構築（近傍探索を O(log n) で実現）
-    tree = KDTree(coords_arr)
-
-    visited = np.zeros(n, dtype=bool)
-    visited[depot_idx] = True   # デポは最初から訪問済み扱い
-
-    # min-heap: (現在時刻[秒], 判定士ID)
-    heap = [(0.0, s) for s in range(m)]
-    heapq.heapify(heap)
-
-    routes   = [[depot_idx] for _ in range(m)]  # 各判定士のルート（デポ始点）
-    cur_pos  = [depot_idx] * m                  # 各判定士の現在位置
-    cur_time = [0.0] * m                        # 各判定士の経過時間[秒]
-    done     = [False] * m                      # これ以上割当不可フラグ
-
-    unassigned = 0
-
-    # 初回クエリの近傍数。未訪問が見つからなければ段階的に拡大
-    k_base = min(30, n)
-
-    remaining = n - 1   # デポを除いた未割当建物数
-
-    while remaining > 0:
-        if all(done):
-            # 全判定士が稼働時間不足で終了 → 残りは未割当
-            unassigned = remaining
-            break
-
-        cur_t, s = heapq.heappop(heap)
-        if done[s]:
-            continue
-
-        pos   = cur_pos[s]
-        t_now = cur_time[s]
-
-        # 近傍を段階的に拡大しながら割当可能な建物を探す
-        found = False
-        for k_try in [k_base, k_base * 5, n]:
-            k_try = min(k_try, n)
-            _, idxs = tree.query(coords_arr[pos], k=k_try)
-            idxs = np.atleast_1d(idxs)
-            for nxt in idxs:
-                if visited[nxt]:
-                    continue
-                t_travel  = travel_sec(pos, int(nxt))
-                t_inspect = inspect_times[nxt]        # この建物の判定時間
-                t_back    = travel_sec(int(nxt), depot_idx)  # デポへの帰還時間
-
-                # 制約チェック: 建物訪問 + 帰還後も最大稼働時間内か
-                if t_now + t_travel + t_inspect + t_back <= max_work_sec:
-                    routes[s].append(int(nxt))
-                    visited[nxt]  = True
-                    cur_pos[s]    = int(nxt)
-                    cur_time[s]   = t_now + t_travel + t_inspect
-                    remaining    -= 1
-                    heapq.heappush(heap, (cur_time[s], s))
-                    found = True
-                    break
-            if found:
-                break
-
-        if not found:
-            # どの未訪問建物も時間制約を満たせない → この判定士は終了
-            done[s] = True
-
-    # 全判定士をデポに帰還させ、稼働時間・移動距離を集計
-    per_time = []
-    per_dist = []
-    for s in range(m):
-        routes[s].append(depot_idx)
-        t_back  = travel_sec(cur_pos[s], depot_idx)
-        total_s = cur_time[s] + t_back
-        per_time.append(total_s / 3600.0)   # 秒 → 時間
-
-        r = routes[s]
-        d = sum(
-            float(np.linalg.norm(coords_arr[r[i]] - coords_arr[r[i+1]])) * area_km
-            for i in range(len(r) - 1)
-        )
-        per_dist.append(d)
-
-    makespan   = max(per_time)
-    total_dist = sum(per_dist)
-    return makespan, total_dist, routes, per_time, per_dist, unassigned
-
-
-def _parallel_mtsp(coords, inspect_times, depot_indices,
-                   m, area_km, speed_kmh, max_work_h, n_workers):
-    """
-    複数のデポ候補で _mtsp_worker を並列実行し、makespan 最小の結果を返す。
-
-    デポ位置によってルートの質が変わるため、複数候補を並列試行することで
-    解の質を向上させる（greedy の確率的改善）。
-    """
-    args_list = [
-        (coords, inspect_times, d, m, area_km, speed_kmh, max_work_h)
-        for d in depot_indices
-    ]
-    best = None
-    with ProcessPoolExecutor(max_workers=n_workers) as ex:
-        futs = {ex.submit(_mtsp_worker, a): a for a in args_list}
-        for f in as_completed(futs):
-            res = f.result()
-            # makespan 優先、同値なら総距離で比較
-            if best is None or (res[0], res[1]) < (best[0], best[1]):
-                best = res
-    return best  # (makespan, total_dist, routes, per_time, per_dist, unassigned)
-
-
-# ── GUI ───────────────────────────────────────────────────────────────────────
-
 class TSPApp:
     def __init__(self, root):
         self.root = root
@@ -213,10 +48,7 @@ class TSPApp:
         self.nodes        = []    # 建物座標リスト [(x, y), ...]  座標系: [0,1]x[0,1]
         self.inspect_times= []    # 建物ごとの判定時間 [秒]
         self.depot_idx    = 0     # デポの建物インデックス
-        self.routes       = []    # 判定士ごとの訪問順インデックスリスト
-        self.per_time     = []    # 判定士ごとの稼働時間 [時間]
-        self.per_dist     = []    # 判定士ごとの移動距離 [km]
-        self.unassigned   = 0     # 未割当建物数
+        self.solution     = None  # mtsp_core.InspectionSolution
         self.solving      = False
         self.n_cpu        = os.cpu_count() or 4
         self.depot_mode_var = tk.StringVar(value="center")
@@ -378,10 +210,7 @@ class TSPApp:
         # 判定時間を [t_min, t_max] 分の範囲でランダム設定（秒換算で保持）
         self.inspect_times = np.random.uniform(
             t_min * 60, t_max * 60, n).tolist()
-        self.routes = []
-        self.per_time = []
-        self.per_dist = []
-        self.unassigned = 0
+        self.solution = None
         self.depot_idx = self._auto_depot()
         self.stat_nodes.config(text=f"建物数: {n:,}")
         self.depot_label.config(text=f"デポ: 拠点 #{self.depot_idx}")
@@ -391,10 +220,7 @@ class TSPApp:
     def clear_nodes(self):
         self.nodes = []
         self.inspect_times = []
-        self.routes = []
-        self.per_time = []
-        self.per_dist = []
-        self.unassigned = 0
+        self.solution = None
         self.stat_nodes.config(text="建物数: 0")
         self._reset_result_stats()
         self._redraw()
@@ -409,14 +235,19 @@ class TSPApp:
         self.stat_status.config(text="状態: 待機中")
         self._update_per_text([])
 
-    def calc_min_m(self):
-        """
-        二分探索で全棟割当可能な最小判定士数を求める。
+    def _make_problem(self, nodes, inspect_times, depot_idx,
+                      area_km, speed, max_work):
+        """GUI 入力値から InspectionProblem を構築する"""
+        return InspectionProblem(
+            coords=np.array(nodes, dtype=np.float64),
+            inspect_times=np.array(inspect_times, dtype=np.float64),
+            depot_idx=depot_idx,
+            area_km=area_km,
+            speed_kmh=speed,
+            max_work_h=max_work)
 
-        探索範囲: [1, 建物数]
-        各試行で _mtsp_worker を呼び unassigned == 0 かどうかを確認。
-        O(log n) 回の試行で収束する。
-        """
+    def calc_min_m(self):
+        """全棟割当可能な最小判定士数を二分探索で求める（mtsp_core に委譲）"""
         if len(self.nodes) < 2:
             messagebox.showwarning("警告", "建物を2棟以上追加してください")
             return
@@ -444,38 +275,25 @@ class TSPApp:
             daemon=True).start()
 
     def _min_m_worker(self, nodes, inspect_times, speed, max_work, area_km):
-        """二分探索の実体。バックグラウンドスレッドで実行される。"""
-        coords = np.array(nodes)
-        it     = np.array(inspect_times, dtype=np.float64)
-        depot  = self._auto_depot()
-        t0     = time.perf_counter()
+        """二分探索のバックグラウンドスレッド本体"""
+        t0 = time.perf_counter()
+        try:
+            problem = self._make_problem(
+                nodes, inspect_times, self._auto_depot(),
+                area_km, speed, max_work)
+            min_m, sol = find_min_inspectors(
+                problem, GreedySolver(),
+                progress=lambda mid: self.root.after(
+                    0, self.stat_status.config,
+                    {"text": f"状態: 探索中... m={mid} を試行"}),
+                should_continue=lambda: self.solving)
+            elapsed = time.perf_counter() - t0
+            self.root.after(0, self._on_min_m_done, min_m, sol, elapsed)
+        except Exception as e:
+            elapsed = time.perf_counter() - t0
+            self.root.after(0, self._on_min_m_done, None, None, elapsed, f"エラー: {e}")
 
-        lo, hi   = 1, len(nodes)
-        best_m   = hi
-        best_res = None
-
-        while lo <= hi:
-            if not self.solving:
-                break
-            mid = (lo + hi) // 2
-            self.root.after(0, self.stat_status.config,
-                            {"text": f"状態: 探索中... m={mid} を試行"})
-            res        = _parallel_mtsp(coords, it, [depot],
-                                        mid, area_km, speed, max_work, 1)
-            unassigned = res[5]
-            if unassigned == 0:
-                # m で全棟対応可能 → さらに少ない m を試す
-                best_m   = mid
-                best_res = res
-                hi       = mid - 1
-            else:
-                # m では足りない → m を増やす
-                lo = mid + 1
-
-        elapsed = time.perf_counter() - t0
-        self.root.after(0, self._on_min_m_done, best_m, best_res, elapsed)
-
-    def _on_min_m_done(self, min_m, res, elapsed):
+    def _on_min_m_done(self, min_m, sol, elapsed, err=None):
         """最小判定士数探索完了時のコールバック（メインスレッドで実行）"""
         self.solving = False
         self.solve_btn.config(state=tk.NORMAL)
@@ -483,24 +301,24 @@ class TSPApp:
         self.stop_btn.config(state=tk.DISABLED)
         self.progress.stop()
 
+        if err:
+            self.stat_status.config(text=f"状態: {err}")
+            return
+
         self.stat_min_m.config(text=f"最小必要判定士数: {min_m} 人")
         self.stat_time.config(text=f"計算時間: {elapsed:.2f} 秒")
         self.m_var.set(str(min_m))  # 判定士数入力欄に反映
 
-        if res:
-            makespan, total_dist, routes, per_time, per_dist, _ = res
-            self.routes     = routes
-            self.per_time   = per_time
-            self.per_dist   = per_dist
-            self.unassigned = 0
-            self.depot_idx  = routes[0][0]
-            h = int(makespan); mn = int((makespan - h) * 60)
+        if sol:
+            self.solution  = sol
+            self.depot_idx = sol.problem.depot_idx
+            h = int(sol.makespan); mn = int((sol.makespan - h) * 60)
             self.stat_makespan.config(text=f"最大終了時間: {h}h{mn:02d}m")
             self.stat_unassign.config(text="未割当建物: 0 棟 (全棟完了)",
                                       fg="#2e7d32")
-            self.stat_dist.config(text=f"総移動距離: {total_dist:.1f} km")
+            self.stat_dist.config(text=f"総移動距離: {sol.total_dist:.1f} km")
             self.stat_m.config(text=f"判定士数: {min_m} (最小)")
-            self._update_per_text(per_time, per_dist)
+            self._update_per_text(sol.per_time, sol.per_dist)
             self._redraw()
 
         self.stat_status.config(
@@ -536,7 +354,7 @@ class TSPApp:
                 np.argmin(np.linalg.norm(arr - [nx, ny], axis=1)))
             self.depot_label.config(
                 text=f"デポ: 拠点 #{self.depot_idx} (クリック指定)")
-            self.routes = []
+            self.solution = None
             self._redraw()
         else:
             try:
@@ -546,7 +364,7 @@ class TSPApp:
                 t_min, t_max = 15, 45
             self.nodes.append((nx, ny))
             self.inspect_times.append(random.uniform(t_min * 60, t_max * 60))
-            self.routes = []
+            self.solution = None
             self.stat_nodes.config(text=f"建物数: {len(self.nodes):,}")
             self._redraw()
 
@@ -565,8 +383,9 @@ class TSPApp:
         self.ax.set_ylim(-0.02, 1.02)
         self.ax.tick_params(colors="#aaa")
 
-        n     = len(self.nodes)
-        extra = f"  未割当: {self.unassigned}" if self.unassigned else ""
+        n = len(self.nodes)
+        n_unassigned = self.solution.n_unassigned if self.solution else 0
+        extra = f"  未割当: {n_unassigned}" if n_unassigned else ""
         self.ax.set_title(
             f"応急危険度判定 mTSP  ({n:,} 建物{extra})",
             color="white", fontsize=11)
@@ -578,8 +397,8 @@ class TSPApp:
         coords = np.array(self.nodes)
 
         # 判定士ごとのルートを色分けして描画
-        if self.routes:
-            for s, route in enumerate(self.routes):
+        if self.solution:
+            for s, route in enumerate(self.solution.routes):
                 color = COLORS[s % len(COLORS)]
                 rc    = coords[route]
                 lw    = max(0.4, 1.4 - n / 25000)
@@ -656,9 +475,9 @@ class TSPApp:
         # デポ候補リストを生成（並列試行回数分）
         mode = self.depot_mode_var.get()
         if mode == "click":
-            depots = [self.depot_idx] * n_starts
+            depots = [self.depot_idx]
         elif mode == "center":
-            depots = [self._auto_depot()] * n_starts
+            depots = [self._auto_depot()]
         else:
             depots = random.sample(range(len(self.nodes)),
                                    min(n_starts, len(self.nodes)))
@@ -678,20 +497,21 @@ class TSPApp:
 
     def _solve_worker(self, nodes, inspect_times, m, speed,
                       max_work, area_km, n_workers, depots):
-        """ソルバーのバックグラウンドスレッド本体"""
-        coords = np.array(nodes)
-        it     = np.array(inspect_times, dtype=np.float64)
-        t0     = time.perf_counter()
+        """ソルバーのバックグラウンドスレッド本体（mtsp_core に委譲）"""
+        t0 = time.perf_counter()
         try:
-            res     = _parallel_mtsp(coords, it, depots,
-                                     m, area_km, speed, max_work, n_workers)
+            problem = self._make_problem(
+                nodes, inspect_times, depots[0], area_km, speed, max_work)
+            solver  = MultiStartSolver(depot_candidates=depots,
+                                       n_workers=n_workers)
+            sol     = solver.solve(problem, m)
             elapsed = time.perf_counter() - t0
-            self.root.after(0, self._on_done, res, elapsed)
+            self.root.after(0, self._on_done, sol, elapsed)
         except Exception as e:
             elapsed = time.perf_counter() - t0
             self.root.after(0, self._on_done, None, elapsed, f"エラー: {e}")
 
-    def _on_done(self, res, elapsed, err=None):
+    def _on_done(self, sol, elapsed, err=None):
         """ソルバー完了時のコールバック（メインスレッドで実行）"""
         self.solving = False
         self.solve_btn.config(state=tk.NORMAL)
@@ -701,29 +521,26 @@ class TSPApp:
         if err:
             self.stat_status.config(text=f"状態: {err}")
             return
-        if res is None:
+        if sol is None:
             self.stat_status.config(text="状態: 失敗")
             return
 
-        makespan, total_dist, routes, per_time, per_dist, unassigned = res
-        self.routes     = routes
-        self.per_time   = per_time
-        self.per_dist   = per_dist
-        self.unassigned = unassigned
-        self.depot_idx  = routes[0][0]
+        self.solution  = sol
+        self.depot_idx = sol.problem.depot_idx
+        n_unassigned   = sol.n_unassigned
 
-        h = int(makespan); mn = int((makespan - h) * 60)
+        h = int(sol.makespan); mn = int((sol.makespan - h) * 60)
         self.stat_makespan.config(text=f"最大終了時間: {h}h{mn:02d}m")
 
         # 未割当があれば赤字で警告
-        color  = "#e74c3c" if unassigned > 0 else "#2e7d32"
-        ua_txt = (f"未割当建物: {unassigned:,} 棟 ← 時間不足"
-                  if unassigned else "未割当建物: 0 棟 (全棟完了)")
+        color  = "#e74c3c" if n_unassigned > 0 else "#2e7d32"
+        ua_txt = (f"未割当建物: {n_unassigned:,} 棟 ← 時間不足"
+                  if n_unassigned else "未割当建物: 0 棟 (全棟完了)")
         self.stat_unassign.config(text=ua_txt, fg=color)
-        self.stat_dist.config(text=f"総移動距離: {total_dist:.1f} km")
+        self.stat_dist.config(text=f"総移動距離: {sol.total_dist:.1f} km")
         self.stat_time.config(text=f"計算時間: {elapsed:.3f} 秒")
         self.stat_status.config(text="状態: 完了")
-        self._update_per_text(per_time, per_dist)
+        self._update_per_text(sol.per_time, sol.per_dist)
         self._redraw()
 
     # ── ベンチマーク ─────────────────────────────────────────────────────────
@@ -746,20 +563,21 @@ class TSPApp:
                          daemon=True).start()
 
     def _bench_worker(self, m, speed, max_work, area_km):
-        sizes     = [100, 500, 1000, 5000, 10000, 50000, 100000]
-        n_workers = self.n_cpu
-        results   = []
+        sizes   = [100, 500, 1000, 5000, 10000, 50000, 100000]
+        solver  = GreedySolver()
+        results = []
         for n in sizes:
             self.root.after(0, self.stat_status.config,
                             {"text": f"ベンチマーク中: n={n:,}"})
-            coords = np.random.random((n, 2)).astype(np.float64)
-            it     = np.random.uniform(15*60, 45*60, n).astype(np.float64)
-            t0     = time.perf_counter()
-            res    = _parallel_mtsp(coords, it, [0],
-                                    m, area_km, speed, max_work, 1)
+            problem = InspectionProblem(
+                coords=np.random.random((n, 2)).astype(np.float64),
+                inspect_times=np.random.uniform(15*60, 45*60, n),
+                depot_idx=0,
+                area_km=area_km, speed_kmh=speed, max_work_h=max_work)
+            t0      = time.perf_counter()
+            sol     = solver.solve(problem, m)
             elapsed = time.perf_counter() - t0
-            makespan, total_dist, _, _, _, unassigned = res
-            results.append((n, elapsed, makespan, unassigned))
+            results.append((n, elapsed, sol.makespan, sol.n_unassigned))
         self.root.after(0, self._show_bench, results, m, max_work)
 
     def _show_bench(self, results, m, max_work):
