@@ -52,6 +52,7 @@ class TSPApp:
 
         self.nodes        = []    # 建物座標リスト [(x, y), ...]  座標系: [0,1]x[0,1]
         self.inspect_times= []    # 建物ごとの判定時間 [秒]
+        self.priorities   = []    # 建物ごとの優先度 p_i (0=通常, 1=優先)
         self.depot_idx    = 0     # デポの建物インデックス
         self.solution     = None  # mtsp_core.InspectionSolution
         self.solving      = False
@@ -80,8 +81,7 @@ class TSPApp:
         self._row(ctrl, "エリア (km):",       "area_var", "10",  6)
         self._row(ctrl, "判定時間 最小(分):", "tmin_var", "15",  6)
         self._row(ctrl, "判定時間 最大(分):", "tmax_var", "45",  6)
-        tk.Label(ctrl, text="建物ごとに判定時間をランダム設定",
-                 bg="#f0f0f0", fg="#666", font=("Arial", 8)).pack(anchor="w")
+        self._row(ctrl, "優先建物割合 (%):",  "prio_var", "10",  6)
         tk.Button(ctrl, text="ランダム建物生成", command=self.generate_random,
                   bg="#4CAF50", fg="white", relief=tk.FLAT, pady=4
                   ).pack(fill=tk.X, pady=2)
@@ -108,21 +108,32 @@ class TSPApp:
         self._row(ctrl, "並列試行回数:",      "starts_var",  str(self.n_cpu),  6)
         self._row(ctrl, "並列数:",            "workers_var", str(self.n_cpu),  6)
         tk.Label(ctrl,
-                 text="目的関数: 最大終了時間(makespan)を最小化\n"
-                      "→ 最も遅い担当者が早く終わるよう割当",
+                 text="目的関数: min MΣz + λΣT + μΣp·a\n"
+                      "(人数・総活動時間・優先建物の早期判定)",
                  bg="#f0f0f0", fg="#1565C0", font=("Arial",8),
                  justify=tk.LEFT).pack(anchor="w", pady=3)
 
         # ソルバー選択セクション
         self._sep(ctrl, "ソルバー")
         for val, lbl in [("greedy",  "貪欲法（高速・大規模対応）"),
-                          ("ortools", "貪欲法 + OR-Tools改善")]:
+                          ("ortools", "貪欲法 + OR-Tools最適化")]:
             tk.Radiobutton(ctrl, text=lbl, variable=self.solver_var,
                            value=val, bg="#f0f0f0").pack(anchor="w")
         self._row(ctrl, "改善時間制限 (秒):", "limit_var", "10", 6)
+        # 目的関数の重み M / λ / μ を 1 行にまとめて入力
+        wfrm = tk.Frame(ctrl, bg="#f0f0f0")
+        wfrm.pack(fill=tk.X, pady=2)
+        tk.Label(wfrm, text="重み", bg="#f0f0f0", width=4,
+                 anchor="w").pack(side=tk.LEFT)
+        for sym, attr, default in [("M:", "wm_var", "1000"),
+                                    ("λ:", "wl_var", "1"),
+                                    ("μ:", "wp_var", "1")]:
+            tk.Label(wfrm, text=sym, bg="#f0f0f0").pack(side=tk.LEFT)
+            var = tk.StringVar(value=default)
+            setattr(self, attr, var)
+            tk.Entry(wfrm, textvariable=var, width=5).pack(side=tk.LEFT, padx=(0,4))
         tk.Label(ctrl,
-                 text=f"OR-Tools改善は {ORTOOLS_MAX_NODES:,} 棟まで\n"
-                      "（貪欲解を初期解に誘導局所探索で改善）",
+                 text=f"OR-Tools最適化は {ORTOOLS_MAX_NODES:,} 棟まで",
                  bg="#f0f0f0", fg="#666", font=("Arial",8),
                  justify=tk.LEFT).pack(anchor="w")
 
@@ -220,6 +231,7 @@ class TSPApp:
             n     = int(self.n_var.get());      assert 2 <= n <= 2_000_000
             t_min = float(self.tmin_var.get()); assert t_min > 0
             t_max = float(self.tmax_var.get()); assert t_max >= t_min
+            p_pct = float(self.prio_var.get()); assert 0 <= p_pct <= 100
         except Exception:
             messagebox.showerror("エラー", "入力値を確認してください")
             return
@@ -229,6 +241,9 @@ class TSPApp:
         # 判定時間を [t_min, t_max] 分の範囲でランダム設定（秒換算で保持）
         self.inspect_times = np.random.uniform(
             t_min * 60, t_max * 60, n).tolist()
+        # 指定割合の建物を優先建物 (p_i = 1) に設定
+        self.priorities = (
+            np.random.random(n) < p_pct / 100.0).astype(float).tolist()
         self.solution = None
         self.depot_idx = self._auto_depot()
         self.stat_nodes.config(text=f"建物数: {n:,}")
@@ -239,6 +254,7 @@ class TSPApp:
     def clear_nodes(self):
         self.nodes = []
         self.inspect_times = []
+        self.priorities = []
         self.solution = None
         self.stat_nodes.config(text="建物数: 0")
         self._reset_result_stats()
@@ -255,7 +271,7 @@ class TSPApp:
         self._update_per_text([])
 
     def _make_problem(self, nodes, inspect_times, depot_idx,
-                      area_km, speed, max_work):
+                      area_km, speed, max_work, priorities=None):
         """GUI 入力値から InspectionProblem を構築する"""
         return InspectionProblem(
             coords=np.array(nodes, dtype=np.float64),
@@ -263,7 +279,9 @@ class TSPApp:
             depot_idx=depot_idx,
             area_km=area_km,
             speed_kmh=speed,
-            max_work_h=max_work)
+            max_work_h=max_work,
+            priorities=(np.array(priorities, dtype=np.float64)
+                        if priorities else None))
 
     def calc_min_m(self):
         """全棟割当可能な最小判定士数を二分探索で求める（mtsp_core に委譲）"""
@@ -379,10 +397,13 @@ class TSPApp:
             try:
                 t_min = float(self.tmin_var.get())
                 t_max = float(self.tmax_var.get())
+                p_pct = float(self.prio_var.get())
             except Exception:
-                t_min, t_max = 15, 45
+                t_min, t_max, p_pct = 15, 45, 10
             self.nodes.append((nx, ny))
             self.inspect_times.append(random.uniform(t_min * 60, t_max * 60))
+            self.priorities.append(
+                1.0 if random.random() < p_pct / 100.0 else 0.0)
             self.solution = None
             self.stat_nodes.config(text=f"建物数: {len(self.nodes):,}")
             self._redraw()
@@ -442,6 +463,16 @@ class TSPApp:
             self.ax.scatter(coords[:, 0], coords[:, 1],
                             c="#76ff03", s=size, alpha=0.75, zorder=3)
 
+        # 優先建物をシアンの二重丸で強調表示
+        if self.priorities and len(self.priorities) == n:
+            pr = np.array(self.priorities)
+            if pr.any():
+                pc = coords[pr > 0]
+                self.ax.scatter(pc[:, 0], pc[:, 1],
+                                facecolors="none", edgecolors="#00e5ff",
+                                s=max(30, 60 - n // 100), linewidths=1.2,
+                                zorder=5, label=f"優先建物 ({len(pc)})")
+
         # デポを金色の星マークで表示
         dep = self.depot_idx if self.nodes else 0
         if 0 <= dep < n:
@@ -484,6 +515,9 @@ class TSPApp:
             n_workers = max(1, int(self.workers_var.get()))
             n_starts  = max(1, int(self.starts_var.get()))
             time_limit = float(self.limit_var.get()); assert time_limit > 0
+            w_m = float(self.wm_var.get()); assert w_m >= 0
+            w_l = float(self.wl_var.get()); assert w_l >= 0
+            w_p = float(self.wp_var.get()); assert w_p >= 0
         except Exception:
             messagebox.showerror("エラー", "入力値を確認してください")
             return
@@ -520,35 +554,40 @@ class TSPApp:
         threading.Thread(
             target=self._solve_worker,
             args=(list(self.nodes), list(self.inspect_times),
+                  list(self.priorities),
                   m, speed, max_work, area_km, n_workers, depots,
-                  use_ortools, time_limit),
+                  use_ortools, time_limit, (w_m, w_l, w_p)),
             daemon=True).start()
 
-    def _solve_worker(self, nodes, inspect_times, m, speed,
+    def _solve_worker(self, nodes, inspect_times, priorities, m, speed,
                       max_work, area_km, n_workers, depots,
-                      use_ortools, time_limit):
+                      use_ortools, time_limit, weights):
         """ソルバーのバックグラウンドスレッド本体（mtsp_core に委譲）"""
         t0 = time.perf_counter()
+        w_m, w_l, w_p = weights
         try:
             problem = self._make_problem(
-                nodes, inspect_times, depots[0], area_km, speed, max_work)
+                nodes, inspect_times, depots[0], area_km, speed, max_work,
+                priorities)
             # まず貪欲法（マルチスタート）で構築解を得る
             solver = MultiStartSolver(depot_candidates=depots,
                                       n_workers=n_workers)
             sol  = solver.solve(problem, m)
             note = None
             if use_ortools:
-                # 貪欲解を初期解として OR-Tools で改善する
+                # 貪欲解を初期解として OR-Tools で最適化する
                 self.root.after(0, self.stat_status.config,
-                                {"text": f"状態: OR-Tools で改善中... "
+                                {"text": f"状態: OR-Tools で最適化中... "
                                          f"(最大 {time_limit:.0f} 秒)"})
-                greedy_makespan = sol.makespan
-                sol = ORToolsSolver(time_limit_s=time_limit).solve(
-                    sol.problem, m, initial=sol)
-                gain = (1 - sol.makespan / greedy_makespan) * 100 \
-                    if greedy_makespan > 0 else 0.0
-                note = (f"貪欲 {greedy_makespan:.3f}h → "
-                        f"OR-Tools {sol.makespan:.3f}h (改善 {gain:.1f}%)")
+                obj_g = sol.objective(w_m, w_l, w_p)
+                sol = ORToolsSolver(
+                    time_limit_s=time_limit, weight_m=w_m,
+                    weight_total=w_l, weight_priority=w_p,
+                ).solve(sol.problem, m, initial=sol)
+                obj_s = sol.objective(w_m, w_l, w_p)
+                gain = (1 - obj_s / obj_g) * 100 if obj_g > 0 else 0.0
+                note = (f"目的関数 {obj_g:,.1f} → {obj_s:,.1f} "
+                        f"(改善 {gain:.1f}%)")
             elapsed = time.perf_counter() - t0
             self.root.after(0, self._on_done, sol, elapsed, None, note)
         except Exception as e:
@@ -573,6 +612,9 @@ class TSPApp:
         self.depot_idx = sol.problem.depot_idx
         n_unassigned   = sol.n_unassigned
 
+        self.stat_m.config(
+            text=f"判定士数: 使用 {sol.n_used} / 上限 {sol.n_inspectors} "
+                 f"(総活動 {sol.total_time:.1f}h)")
         h = int(sol.makespan); mn = int((sol.makespan - h) * 60)
         self.stat_makespan.config(text=f"最大終了時間: {h}h{mn:02d}m")
 

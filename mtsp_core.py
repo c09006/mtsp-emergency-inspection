@@ -17,7 +17,13 @@
 2. 判定士は拠点（デポ）から出発・拠点に帰還
 3. 移動時間（距離 / 速度）と判定時間を稼働時間に加算
 4. 現在時刻 + 移動 + 判定 + デポ帰還 ≤ 最大稼働時間 を満たす場合のみ割当
-5. 目的関数: 最大終了時間（makespan）の最小化
+
+【目的関数（ORToolsSolver）】
+    min  M Σ z_q  +  λ Σ T_q  +  μ Σ p_i a_i
+    - z_q : 判定士 q を使用するか (0/1)          → 人数の最小化
+    - T_q : 判定士 q の総活動時間（移動+判定）[h] → 総活動時間の最小化
+    - a_i : 建物 i の判定開始時刻 [h]、p_i: 優先度 → 優先建築物の早期判定
+GreedySolver は makespan を平準化する構築ヒューリスティック（初期解生成用）。
 """
 from __future__ import annotations
 
@@ -50,6 +56,7 @@ class InspectionProblem:
         area_km       : エリア一辺の実寸 [km]
         speed_kmh     : 判定士の移動速度 [km/h]
         max_work_h    : 判定士 1 人あたりの最大稼働時間 [時間]
+        priorities    : (n,) 建物ごとの優先度 p_i（0 = 通常）。省略時は全建物 0
     """
     coords: np.ndarray
     inspect_times: np.ndarray
@@ -57,16 +64,24 @@ class InspectionProblem:
     area_km: float
     speed_kmh: float
     max_work_h: float
+    priorities: Optional[np.ndarray] = None
 
     def __post_init__(self):
         coords = np.asarray(self.coords, dtype=np.float64)
         times = np.asarray(self.inspect_times, dtype=np.float64)
+        prios = (np.zeros(len(coords)) if self.priorities is None
+                 else np.asarray(self.priorities, dtype=np.float64))
         object.__setattr__(self, "coords", coords)
         object.__setattr__(self, "inspect_times", times)
+        object.__setattr__(self, "priorities", prios)
         if coords.ndim != 2 or coords.shape[1] != 2:
             raise ValueError("coords は (n, 2) の配列である必要があります")
         if len(times) != len(coords):
             raise ValueError("inspect_times の長さが coords と一致しません")
+        if len(prios) != len(coords):
+            raise ValueError("priorities の長さが coords と一致しません")
+        if np.any(prios < 0):
+            raise ValueError("priorities は非負である必要があります")
         if not (0 <= self.depot_idx < len(coords)):
             raise ValueError(f"depot_idx={self.depot_idx} が範囲外です")
         if self.area_km <= 0 or self.speed_kmh <= 0 or self.max_work_h <= 0:
@@ -106,7 +121,8 @@ class InspectionProblem:
         """デポだけを差し替えた問題インスタンスを返す（マルチスタート用）"""
         return InspectionProblem(
             self.coords, self.inspect_times, depot_idx,
-            self.area_km, self.speed_kmh, self.max_work_h)
+            self.area_km, self.speed_kmh, self.max_work_h,
+            self.priorities)
 
 
 # ── 解 ────────────────────────────────────────────────────────────────────────
@@ -175,6 +191,47 @@ class InspectionSolution:
     def n_unassigned(self) -> int:
         return len(self.unassigned)
 
+    @property
+    def n_used(self) -> int:
+        """実際に建物を割り当てられた（使用された）判定士数 Σz_q"""
+        return sum(1 for r in self.routes if len(r) > 2)
+
+    @property
+    def total_time(self) -> float:
+        """全判定士の総活動時間 Σ T_q [時間]（移動 + 判定）"""
+        return sum(self.per_time)
+
+    @cached_property
+    def arrival_times(self) -> np.ndarray:
+        """
+        建物ごとの判定開始時刻 a_i [時間]。未訪問（デポ・未割当）は NaN。
+        a_i = デポ出発からの累積（移動 + それまでの判定）で、建物 i の
+        判定を開始する時刻。
+        """
+        p = self.problem
+        a = np.full(p.n_buildings, np.nan)
+        for route in self.routes:
+            t = 0.0
+            for k in range(1, len(route) - 1):
+                t += p.travel_sec(route[k - 1], route[k])
+                a[route[k]] = t / 3600.0
+                t += float(p.inspect_times[route[k]])
+        return a
+
+    @property
+    def priority_cost(self) -> float:
+        """優先度重み付き判定開始時刻の合計 Σ p_i a_i [時間]（未割当は除外）"""
+        a = self.arrival_times
+        mask = ~np.isnan(a)
+        return float((self.problem.priorities[mask] * a[mask]).sum())
+
+    def objective(self, weight_m: float, weight_total: float,
+                  weight_priority: float) -> float:
+        """目的関数値 M Σz_q + λ ΣT_q + μ Σp_i a_i を返す"""
+        return (weight_m * self.n_used
+                + weight_total * self.total_time
+                + weight_priority * self.priority_cost)
+
     def validate(self, tol: float = 1e-6) -> list:
         """制約違反のリストを返す（空なら実行可能解）"""
         p = self.problem
@@ -202,7 +259,9 @@ class InspectionSolution:
         return not self.validate(tol)
 
     def summary(self) -> str:
-        return (f"判定士 {self.n_inspectors} 人 | makespan {self.makespan:.3f}h | "
+        return (f"判定士 {self.n_used}/{self.n_inspectors} 人 | "
+                f"makespan {self.makespan:.3f}h | 総活動 {self.total_time:.2f}h | "
+                f"優先コスト {self.priority_cost:.2f} | "
                 f"総距離 {self.total_dist:.1f}km | 未割当 {self.n_unassigned} 棟")
 
 
@@ -370,14 +429,25 @@ class MultiStartSolver(SolverBase):
 
 class ORToolsSolver(SolverBase):
     """
-    OR-Tools ルーティングソルバーによる makespan 最小化。
+    OR-Tools ルーティングソルバーによる重み付き多目的最適化。
 
-    【数理モデルとの対応】
-    - 目的関数 min T (makespan)  → Time 次元の SetGlobalSpanCostCoefficient
-      （出発時刻を 0 に固定しているため、span = 最遅帰還時刻 = makespan）
+    【目的関数】
+        min  M Σ z_q  +  λ Σ T_q  +  μ Σ p_i a_i
+        - M Σ z_q     : 使用判定士数（人数の最小化）
+        - λ Σ T_q     : 総活動時間 [h]（移動 + 判定）
+        - μ Σ p_i a_i : 優先度重み付き判定開始時刻 [h]（優先建築物の早期判定）
+
+    【OR-Tools での実装】
+    - M z_q      → SetFixedCostOfAllVehicles（使用車両ごとの固定費）
+    - λ T_q      → アークコスト（移動 + 判定時間の推移に係数 λ）
+    - μ p_i a_i  → Time 次元の SetCumulVarSoftUpperBound(i, 0, μ p_i)
+                   （上限 0 の soft 制約 → コスト = 係数 × 判定開始時刻）
     - 稼働時間制約 ≤ max_work_h → Time 次元の capacity
-    - 移動時間 + 判定時間       → 推移コールバック travel(i,j) + service(i)
     - 未割当の許容              → AddDisjunction（ペナルティ付きドロップ）
+
+    m は「使用できる判定士数の上限」であり、何人使うかはソルバーが決める。
+    重みの単位: T_q・a_i は時間 [h]。M は「1 人追加 = M 時間分のコスト」に相当。
+    内部では秒単位・整数コスト（重みは WEIGHT_SCALE 倍で量子化、精度 0.01）。
 
     【解法】
     貪欲解（initial に渡す）を初期解として誘導局所探索 (GUIDED_LOCAL_SEARCH)
@@ -387,12 +457,18 @@ class ORToolsSolver(SolverBase):
     GreedySolver / MultiStartSolver を使用する。
     """
 
+    WEIGHT_SCALE = 100   # 重みの量子化精度（1/WEIGHT_SCALE 刻み）
+
     def __init__(self, time_limit_s: float = 10.0,
-                 span_cost_coefficient: int = 100,
+                 weight_m: float = 1000.0,
+                 weight_total: float = 1.0,
+                 weight_priority: float = 1.0,
                  max_nodes: int = 2000,
                  log_search: bool = False):
         self.time_limit_s = time_limit_s
-        self.span_cost_coefficient = span_cost_coefficient
+        self.weight_m = weight_m               # M: 人数の重み [時間相当]
+        self.weight_total = weight_total       # λ: 総活動時間の重み
+        self.weight_priority = weight_priority # μ: 優先建物の早期判定の重み
         self.max_nodes = max_nodes
         self.log_search = log_search
 
@@ -424,7 +500,15 @@ class ORToolsSolver(SolverBase):
         manager = pywrapcp.RoutingIndexManager(n, m, depot)
         routing = pywrapcp.RoutingModel(manager)
 
-        # 推移 = 出発地での判定時間 + 移動時間
+        # 重みを整数化（内部コスト単位: [秒 × WEIGHT_SCALE]）
+        scale   = self.WEIGHT_SCALE
+        m_int   = int(round(self.weight_m * 3600 * scale))       # M [h] → 秒相当
+        lam_int = int(round(self.weight_total * scale))          # λ
+        mu_int  = np.round(
+            self.weight_priority * problem.priorities * scale
+        ).astype(np.int64)                                       # μ p_i
+
+        # 推移 = 出発地での判定時間 + 移動時間（Time 次元用、秒）
         time_mat = (travel + service[:, None]).tolist()
 
         def time_cb(from_index, to_index):
@@ -433,17 +517,37 @@ class ORToolsSolver(SolverBase):
             return time_mat[i][j]
 
         transit_idx = routing.RegisterTransitCallback(time_cb)
-        routing.SetArcCostEvaluatorOfAllVehicles(transit_idx)
+
+        # λ Σ T_q: 総活動時間をアークコストとして最小化
+        cost_mat = ((travel + service[:, None]) * lam_int).tolist()
+
+        def cost_cb(from_index, to_index):
+            i = manager.IndexToNode(from_index)
+            j = manager.IndexToNode(to_index)
+            return cost_mat[i][j]
+
+        cost_idx = routing.RegisterTransitCallback(cost_cb)
+        routing.SetArcCostEvaluatorOfAllVehicles(cost_idx)
+
+        # M Σ z_q: 使用した判定士 1 人ごとの固定費（人数の最小化）
+        routing.SetFixedCostOfAllVehicles(m_int)
 
         # 稼働時間制約: 各判定士の累積時間（移動+判定+帰還）≤ max_work_sec
         routing.AddDimension(transit_idx, 0, max_work_sec, True, "Time")
         time_dim = routing.GetDimensionOrDie("Time")
-        # makespan 最小化: 最遅帰還時刻にコスト係数をかける
-        time_dim.SetGlobalSpanCostCoefficient(self.span_cost_coefficient)
+
+        # μ Σ p_i a_i: 優先建物の判定開始時刻（= Time 次元の累積値）にコスト。
+        # 上限 0 の soft 制約なので「超過分 = a_i そのもの」に係数がかかる
+        for node in range(n):
+            if node != depot and mu_int[node] > 0:
+                time_dim.SetCumulVarSoftUpperBound(
+                    manager.NodeToIndex(node), 0, int(mu_int[node]))
 
         # 未割当の許容: 大きなペナルティ付きで建物をドロップ可能にする
-        # （時間的に全棟不可能な場合でも解が返るようにする）
-        drop_penalty = max_work_sec * (self.span_cost_coefficient + m) * 10
+        # （時間的に全棟不可能な場合でも解が返るようにする）。
+        # ペナルティは「1 棟ドロップで節約できる最大コスト」を確実に上回る値
+        max_mu = int(mu_int.max()) if len(mu_int) else 0
+        drop_penalty = (m_int + (lam_int + max_mu) * max_work_sec) * 10
         for node in range(n):
             if node != depot:
                 routing.AddDisjunction([manager.NodeToIndex(node)], drop_penalty)
