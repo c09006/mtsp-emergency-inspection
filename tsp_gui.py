@@ -10,7 +10,8 @@ Time-Constrained mTSP for Emergency Building Inspection
 GUI（tkinter + matplotlib）のみを担当する。
 
 【依存ライブラリ】
-    pip install scipy matplotlib numpy
+    pip install scipy matplotlib numpy ortools
+    （ortools は「OR-Tools改善」ソルバーを使う場合のみ必要）
 """
 
 import tkinter as tk
@@ -26,8 +27,12 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 from mtsp_core import (
-    InspectionProblem, GreedySolver, MultiStartSolver, find_min_inspectors,
+    InspectionProblem, GreedySolver, MultiStartSolver, ORToolsSolver,
+    find_min_inspectors,
 )
+
+# ORToolsSolver が密行列で扱える上限（これ以上は貪欲法のみ）
+ORTOOLS_MAX_NODES = 2000
 
 
 # 判定士ごとのルート描画色（最大20人分）
@@ -52,6 +57,7 @@ class TSPApp:
         self.solving      = False
         self.n_cpu        = os.cpu_count() or 4
         self.depot_mode_var = tk.StringVar(value="center")
+        self.solver_var     = tk.StringVar(value="greedy")
 
         self._build_ui()
 
@@ -106,6 +112,19 @@ class TSPApp:
                       "→ 最も遅い担当者が早く終わるよう割当",
                  bg="#f0f0f0", fg="#1565C0", font=("Arial",8),
                  justify=tk.LEFT).pack(anchor="w", pady=3)
+
+        # ソルバー選択セクション
+        self._sep(ctrl, "ソルバー")
+        for val, lbl in [("greedy",  "貪欲法（高速・大規模対応）"),
+                          ("ortools", "貪欲法 + OR-Tools改善")]:
+            tk.Radiobutton(ctrl, text=lbl, variable=self.solver_var,
+                           value=val, bg="#f0f0f0").pack(anchor="w")
+        self._row(ctrl, "改善時間制限 (秒):", "limit_var", "10", 6)
+        tk.Label(ctrl,
+                 text=f"OR-Tools改善は {ORTOOLS_MAX_NODES:,} 棟まで\n"
+                      "（貪欲解を初期解に誘導局所探索で改善）",
+                 bg="#f0f0f0", fg="#666", font=("Arial",8),
+                 justify=tk.LEFT).pack(anchor="w")
 
         # 実行ボタン群
         self.solve_btn = tk.Button(
@@ -464,12 +483,21 @@ class TSPApp:
             area_km   = float(self.area_var.get());     assert area_km > 0
             n_workers = max(1, int(self.workers_var.get()))
             n_starts  = max(1, int(self.starts_var.get()))
+            time_limit = float(self.limit_var.get()); assert time_limit > 0
         except Exception:
             messagebox.showerror("エラー", "入力値を確認してください")
             return
 
         if m > len(COLORS):
             messagebox.showerror("エラー", f"判定士数は {len(COLORS)} 以下にしてください")
+            return
+
+        use_ortools = self.solver_var.get() == "ortools"
+        if use_ortools and len(self.nodes) > ORTOOLS_MAX_NODES:
+            messagebox.showerror(
+                "エラー",
+                f"OR-Tools改善は {ORTOOLS_MAX_NODES:,} 棟までです。\n"
+                f"建物数を減らすか、貪欲法を選択してください")
             return
 
         # デポ候補リストを生成（並列試行回数分）
@@ -492,26 +520,42 @@ class TSPApp:
         threading.Thread(
             target=self._solve_worker,
             args=(list(self.nodes), list(self.inspect_times),
-                  m, speed, max_work, area_km, n_workers, depots),
+                  m, speed, max_work, area_km, n_workers, depots,
+                  use_ortools, time_limit),
             daemon=True).start()
 
     def _solve_worker(self, nodes, inspect_times, m, speed,
-                      max_work, area_km, n_workers, depots):
+                      max_work, area_km, n_workers, depots,
+                      use_ortools, time_limit):
         """ソルバーのバックグラウンドスレッド本体（mtsp_core に委譲）"""
         t0 = time.perf_counter()
         try:
             problem = self._make_problem(
                 nodes, inspect_times, depots[0], area_km, speed, max_work)
-            solver  = MultiStartSolver(depot_candidates=depots,
-                                       n_workers=n_workers)
-            sol     = solver.solve(problem, m)
+            # まず貪欲法（マルチスタート）で構築解を得る
+            solver = MultiStartSolver(depot_candidates=depots,
+                                      n_workers=n_workers)
+            sol  = solver.solve(problem, m)
+            note = None
+            if use_ortools:
+                # 貪欲解を初期解として OR-Tools で改善する
+                self.root.after(0, self.stat_status.config,
+                                {"text": f"状態: OR-Tools で改善中... "
+                                         f"(最大 {time_limit:.0f} 秒)"})
+                greedy_makespan = sol.makespan
+                sol = ORToolsSolver(time_limit_s=time_limit).solve(
+                    sol.problem, m, initial=sol)
+                gain = (1 - sol.makespan / greedy_makespan) * 100 \
+                    if greedy_makespan > 0 else 0.0
+                note = (f"貪欲 {greedy_makespan:.3f}h → "
+                        f"OR-Tools {sol.makespan:.3f}h (改善 {gain:.1f}%)")
             elapsed = time.perf_counter() - t0
-            self.root.after(0, self._on_done, sol, elapsed)
+            self.root.after(0, self._on_done, sol, elapsed, None, note)
         except Exception as e:
             elapsed = time.perf_counter() - t0
             self.root.after(0, self._on_done, None, elapsed, f"エラー: {e}")
 
-    def _on_done(self, sol, elapsed, err=None):
+    def _on_done(self, sol, elapsed, err=None, note=None):
         """ソルバー完了時のコールバック（メインスレッドで実行）"""
         self.solving = False
         self.solve_btn.config(state=tk.NORMAL)
@@ -539,7 +583,8 @@ class TSPApp:
         self.stat_unassign.config(text=ua_txt, fg=color)
         self.stat_dist.config(text=f"総移動距離: {sol.total_dist:.1f} km")
         self.stat_time.config(text=f"計算時間: {elapsed:.3f} 秒")
-        self.stat_status.config(text="状態: 完了")
+        self.stat_status.config(
+            text=f"状態: 完了 — {note}" if note else "状態: 完了")
         self._update_per_text(sol.per_time, sol.per_dist)
         self._redraw()
 

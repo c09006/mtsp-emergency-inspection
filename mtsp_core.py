@@ -8,6 +8,8 @@
 - SolverBase         : 解法の共通インターフェース。ソルバーを差し替えて比較実験できる
     - GreedySolver     : 最近傍法 + KDTree + min-heap による時間制約付き貪欲法
     - MultiStartSolver : 複数デポ候補の並列試行（マルチスタート）
+    - ORToolsSolver    : OR-Tools ルーティングソルバーによる makespan 最小化
+                         （貪欲解を初期解に誘導局所探索で改善）
 - find_min_inspectors: 全棟割当可能な最小判定士数の二分探索
 
 【制約条件】
@@ -364,6 +366,130 @@ class MultiStartSolver(SolverBase):
 
         return min(solutions,
                    key=lambda s: (s.n_unassigned, s.makespan, s.total_dist))
+
+
+class ORToolsSolver(SolverBase):
+    """
+    OR-Tools ルーティングソルバーによる makespan 最小化。
+
+    【数理モデルとの対応】
+    - 目的関数 min T (makespan)  → Time 次元の SetGlobalSpanCostCoefficient
+      （出発時刻を 0 に固定しているため、span = 最遅帰還時刻 = makespan）
+    - 稼働時間制約 ≤ max_work_h → Time 次元の capacity
+    - 移動時間 + 判定時間       → 推移コールバック travel(i,j) + service(i)
+    - 未割当の許容              → AddDisjunction（ペナルティ付きドロップ）
+
+    【解法】
+    貪欲解（initial に渡す）を初期解として誘導局所探索 (GUIDED_LOCAL_SEARCH)
+    で時間制限まで改善する。初期解がなければ PATH_CHEAPEST_ARC で構築する。
+
+    時間行列を密行列で持つため対象は max_nodes 棟まで。それ以上の規模は
+    GreedySolver / MultiStartSolver を使用する。
+    """
+
+    def __init__(self, time_limit_s: float = 10.0,
+                 span_cost_coefficient: int = 100,
+                 max_nodes: int = 2000,
+                 log_search: bool = False):
+        self.time_limit_s = time_limit_s
+        self.span_cost_coefficient = span_cost_coefficient
+        self.max_nodes = max_nodes
+        self.log_search = log_search
+
+    def solve(self, problem: InspectionProblem, m: int,
+              initial: Optional[InspectionSolution] = None) -> InspectionSolution:
+        # ortools は重い依存なので、このソルバーを使うときだけ import する
+        from ortools.constraint_solver import pywrapcp, routing_enums_pb2
+
+        n = problem.n_buildings
+        if m < 1:
+            raise ValueError("判定士数 m は 1 以上が必要です")
+        if n > self.max_nodes:
+            raise ValueError(
+                f"ORToolsSolver は {self.max_nodes:,} 棟までです（指定: {n:,} 棟）。"
+                f"大規模問題には GreedySolver を使用してください")
+
+        depot = problem.depot_idx
+
+        # 時間行列 [秒, 整数]。切り上げにより「整数モデルで実行可能なら
+        # 実数値の稼働時間制約も必ず満たす」ことを保証する
+        diff = problem.coords[:, None, :] - problem.coords[None, :, :]
+        travel = np.ceil(
+            np.sqrt((diff ** 2).sum(axis=2)) * problem.sec_per_unit
+        ).astype(np.int64)
+        service = np.ceil(problem.inspect_times).astype(np.int64)
+        service[depot] = 0          # デポ（拠点）自体は判定しない
+        max_work_sec = int(problem.max_work_h * 3600)
+
+        manager = pywrapcp.RoutingIndexManager(n, m, depot)
+        routing = pywrapcp.RoutingModel(manager)
+
+        # 推移 = 出発地での判定時間 + 移動時間
+        time_mat = (travel + service[:, None]).tolist()
+
+        def time_cb(from_index, to_index):
+            i = manager.IndexToNode(from_index)
+            j = manager.IndexToNode(to_index)
+            return time_mat[i][j]
+
+        transit_idx = routing.RegisterTransitCallback(time_cb)
+        routing.SetArcCostEvaluatorOfAllVehicles(transit_idx)
+
+        # 稼働時間制約: 各判定士の累積時間（移動+判定+帰還）≤ max_work_sec
+        routing.AddDimension(transit_idx, 0, max_work_sec, True, "Time")
+        time_dim = routing.GetDimensionOrDie("Time")
+        # makespan 最小化: 最遅帰還時刻にコスト係数をかける
+        time_dim.SetGlobalSpanCostCoefficient(self.span_cost_coefficient)
+
+        # 未割当の許容: 大きなペナルティ付きで建物をドロップ可能にする
+        # （時間的に全棟不可能な場合でも解が返るようにする）
+        drop_penalty = max_work_sec * (self.span_cost_coefficient + m) * 10
+        for node in range(n):
+            if node != depot:
+                routing.AddDisjunction([manager.NodeToIndex(node)], drop_penalty)
+
+        params = pywrapcp.DefaultRoutingSearchParameters()
+        params.first_solution_strategy = (
+            routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC)
+        params.local_search_metaheuristic = (
+            routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH)
+        params.time_limit.FromMilliseconds(int(self.time_limit_s * 1000))
+        params.log_search = self.log_search
+
+        assignment = None
+        if initial is not None and initial.routes:
+            # 貪欲解を初期解として渡す（デポ端点と未割当は除く）
+            init_routes = [r[1:-1] for r in initial.routes][:m]
+            init_routes += [[] for _ in range(m - len(init_routes))]
+            routing.CloseModelWithParameters(params)
+            init_assignment = routing.ReadAssignmentFromRoutes(init_routes, True)
+            if init_assignment is not None:
+                assignment = routing.SolveFromAssignmentWithParameters(
+                    init_assignment, params)
+        if assignment is None:
+            assignment = routing.SolveWithParameters(params)
+        if assignment is None:
+            raise RuntimeError("OR-Tools が解を見つけられませんでした")
+
+        # 解の取り出し
+        routes = []
+        for v in range(m):
+            idx = routing.Start(v)
+            route = []
+            while not routing.IsEnd(idx):
+                route.append(manager.IndexToNode(idx))
+                idx = assignment.Value(routing.NextVar(idx))
+            route.append(manager.IndexToNode(idx))   # 終端 = デポ
+            routes.append(route)
+
+        unassigned = [
+            node for node in range(n)
+            if node != depot
+            and assignment.Value(
+                routing.NextVar(manager.NodeToIndex(node)))
+                == manager.NodeToIndex(node)
+        ]
+        return InspectionSolution(problem, routes, unassigned)
 
 
 # ── 最小判定士数の探索 ────────────────────────────────────────────────────────
