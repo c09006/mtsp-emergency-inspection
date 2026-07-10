@@ -67,10 +67,40 @@ class TSPApp:
     # ── UI 構築 ───────────────────────────────────────────────────────────────
 
     def _build_ui(self):
-        # 左側コントロールパネル
-        ctrl = tk.Frame(self.root, width=310, bg="#f0f0f0", padx=10, pady=8)
-        ctrl.pack(side=tk.LEFT, fill=tk.Y)
-        ctrl.pack_propagate(False)
+        # 左側コントロールパネル（縦スクロール対応）
+        # Canvas の中に Frame を埋め込み、ウィンドウが小さいときは
+        # スクロールバー / マウスホイールで下部の項目にアクセスできる
+        outer = tk.Frame(self.root, width=330, bg="#f0f0f0")
+        outer.pack(side=tk.LEFT, fill=tk.Y)
+        outer.pack_propagate(False)
+
+        ctrl_canvas = tk.Canvas(outer, bg="#f0f0f0", highlightthickness=0)
+        ctrl_bar = ttk.Scrollbar(outer, orient="vertical",
+                                 command=ctrl_canvas.yview)
+        ctrl_canvas.configure(yscrollcommand=ctrl_bar.set)
+        ctrl_bar.pack(side=tk.RIGHT, fill=tk.Y)
+        ctrl_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        ctrl = tk.Frame(ctrl_canvas, bg="#f0f0f0", padx=10, pady=8)
+        ctrl_win = ctrl_canvas.create_window((0, 0), window=ctrl, anchor="nw")
+
+        # 内部 Frame のサイズ変化に合わせてスクロール範囲を更新
+        ctrl.bind("<Configure>", lambda e: ctrl_canvas.configure(
+            scrollregion=ctrl_canvas.bbox("all")))
+        # Canvas の幅に内部 Frame の幅を追従させる
+        ctrl_canvas.bind("<Configure>", lambda e: ctrl_canvas.itemconfigure(
+            ctrl_win, width=e.width))
+
+        # マウスホイール: ポインタがパネル上にあるときだけスクロール
+        def _on_mousewheel(event):
+            w = self.root.winfo_containing(event.x_root, event.y_root)
+            while w is not None:
+                if w is outer:
+                    ctrl_canvas.yview_scroll(
+                        int(-event.delta / 120), "units")
+                    break
+                w = w.master
+        self.root.bind_all("<MouseWheel>", _on_mousewheel)
 
         tk.Label(ctrl, text="応急危険度判定 mTSP",
                  font=("Arial", 12, "bold"), bg="#f0f0f0").pack(pady=(0,3))
