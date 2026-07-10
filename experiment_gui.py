@@ -75,13 +75,16 @@ class ExperimentApp:
                  bg="#f0f0f0").pack(pady=(0, 4))
 
         # 共通設定
+        n_cpu = os.cpu_count() or 4
         self._sep(ctrl, "共通設定")
         self._row(ctrl, "建物数:",              "n_var",     "200")
         self._row(ctrl, "シード数:",            "seeds_var", "5")
         self._row(ctrl, "OR-Tools制限 (秒):",   "limit_var", "30")
         self._row(ctrl, "優先の重み μ:",        "mu_var",    "1")
         self._row(ctrl, "基準の規定時間 H (h):","hbase_var", "8")
-        tk.Label(ctrl, text="M は人数最小化が最優先になる\n閾値を自動計算して設定",
+        self._row(ctrl, "並列数:",              "workers_var", str(n_cpu))
+        tk.Label(ctrl, text=f"M は人数最小化が最優先になる\n閾値を自動計算して設定\n"
+                            f"並列数はコア数 ({n_cpu}) まで有効",
                  bg="#f0f0f0", fg="#666", font=("Arial", 8),
                  justify=tk.LEFT).pack(anchor="w")
 
@@ -226,7 +229,8 @@ class ExperimentApp:
         assert 2 <= base.n <= 2000, "建物数は 2〜2000 棟"
         seeds = list(range(int(self.seeds_var.get())))
         assert seeds, "シード数は 1 以上"
-        return base, seeds
+        n_workers = max(1, int(self.workers_var.get()))
+        return base, seeds, n_workers
 
     def _estimate_jobs(self, kind, base, seeds):
         if kind == "noise":
@@ -243,7 +247,7 @@ class ExperimentApp:
         if self.running:
             return
         try:
-            base, seeds = self._read_params()
+            base, seeds, n_workers = self._read_params()
         except AssertionError as e:
             messagebox.showerror("エラー", str(e))
             return
@@ -253,16 +257,19 @@ class ExperimentApp:
 
         kind = self.exp_var.get()
         n_jobs = self._estimate_jobs(kind, base, seeds)
-        est_min = n_jobs * (base.time_limit + 3) / 60
+        eff_workers = max(1, min(n_workers, os.cpu_count() or 1))
+        est_min = n_jobs * (base.time_limit + 3) / 60 / eff_workers
         self.estimate_lbl.config(
-            text=f"実行数: {n_jobs} 回 / 目安 約{est_min:.0f} 分")
+            text=f"実行数: {n_jobs} 回 × {eff_workers} 並列 / "
+                 f"目安 約{max(1, est_min):.0f} 分")
 
         self.running = True
         self.run_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
         self.progress.config(maximum=n_jobs, value=0)
         self._log_clear()
-        threading.Thread(target=self._worker, args=(kind, base, seeds),
+        threading.Thread(target=self._worker,
+                         args=(kind, base, seeds, n_workers),
                          daemon=True).start()
 
     def stop(self):
@@ -293,11 +300,12 @@ class ExperimentApp:
             pass
         self.root.after(200, self._poll_queue)
 
-    def _worker(self, kind, base, seeds):
+    def _worker(self, kind, base, seeds, n_workers):
         try:
             runner = ExperimentRunner(
                 status_cb=self._status,
-                should_continue=lambda: self.running)
+                should_continue=lambda: self.running,
+                n_workers=n_workers)
             tag = f"n{base.n}_s{len(seeds)}"
 
             if kind == "noise":

@@ -24,6 +24,7 @@ import argparse
 import csv
 import os
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, replace, asdict
 from typing import Callable, Optional, Sequence
 
@@ -107,9 +108,15 @@ class ExperimentRunner:
     """
 
     def __init__(self, status_cb: Optional[Callable[[str], None]] = None,
-                 should_continue: Optional[Callable[[], bool]] = None):
+                 should_continue: Optional[Callable[[], bool]] = None,
+                 n_workers: int = 1):
         self.status_cb = status_cb or (lambda msg: None)
         self.should_continue = should_continue or (lambda: True)
+        # 並列実行数。各実行の OR-Tools は実質 1 コアしか使わないため、
+        # 物理コア数まで並列化するとほぼコア数倍になる。
+        # コア数を超えると各実行が時間制限内に探索できる量が減り
+        # 解の質が下がるので、上限をコア数に丸める
+        self.n_workers = max(1, min(n_workers, os.cpu_count() or 1))
 
     def run_one(self, sc: Scenario, seed: int) -> Optional[dict]:
         self.status_cb(f"  seed={seed}: 問題生成・貪欲法二分探索...")
@@ -169,34 +176,59 @@ class ExperimentRunner:
     def run_many(self, scenarios: Sequence[tuple],
                  csv_path: Optional[str] = None) -> list:
         """
-        (Scenario, seed) のリストを順に実行し、行の辞書リストを返す。
+        (Scenario, seed) のリストを実行し、行の辞書リストを返す。
+        n_workers > 1 なら ProcessPoolExecutor で並列実行する。
         csv_path を指定すると 1 行完了するごとに追記保存する（中断に強い）。
         """
         rows = []
         total = len(scenarios)
         writer = None
         f = None
+
+        def save(row):
+            nonlocal writer, f
+            rows.append(row)
+            if csv_path:
+                if writer is None:
+                    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+                    new = not os.path.exists(csv_path)
+                    f = open(csv_path, "a", newline="", encoding="utf-8-sig")
+                    writer = csv.DictWriter(f, fieldnames=row.keys())
+                    if new:
+                        writer.writeheader()
+                writer.writerow(row)
+                f.flush()
+
         try:
-            for i, (sc, seed) in enumerate(scenarios, 1):
-                if not self.should_continue():
-                    self.status_cb("中止されました（完了分は保存済み）")
-                    break
-                self.status_cb(f"[{i}/{total}] {self._label(sc)}")
-                row = self.run_one(sc, seed)
-                if row is None:
-                    continue
-                rows.append(row)
-                if csv_path:
-                    if writer is None:
-                        os.makedirs(os.path.dirname(csv_path), exist_ok=True)
-                        new = not os.path.exists(csv_path)
-                        f = open(csv_path, "a", newline="",
-                                 encoding="utf-8-sig")
-                        writer = csv.DictWriter(f, fieldnames=row.keys())
-                        if new:
-                            writer.writeheader()
-                    writer.writerow(row)
-                    f.flush()
+            if self.n_workers == 1:
+                for i, (sc, seed) in enumerate(scenarios, 1):
+                    if not self.should_continue():
+                        self.status_cb("中止されました（完了分は保存済み）")
+                        break
+                    self.status_cb(f"[{i}/{total}] {self._label(sc)}")
+                    row = self.run_one(sc, seed)
+                    if row is not None:
+                        save(row)
+            else:
+                self.status_cb(f"並列実行: {self.n_workers} ワーカー / "
+                               f"{total} ジョブ")
+                done = 0
+                with ProcessPoolExecutor(max_workers=self.n_workers) as ex:
+                    futs = {ex.submit(_experiment_job, (sc, seed)): sc
+                            for sc, seed in scenarios}
+                    for fut in as_completed(futs):
+                        if not self.should_continue():
+                            for other in futs:
+                                other.cancel()
+                            self.status_cb(
+                                "中止 — 実行中のジョブ完了後に停止します")
+                            break
+                        done += 1
+                        self.status_cb(f"[{done}/{total}] "
+                                       f"{self._label(futs[fut])} 完了")
+                        row = fut.result()
+                        if row is not None:
+                            save(row)
         finally:
             if f:
                 f.close()
@@ -206,6 +238,12 @@ class ExperimentRunner:
     def _label(sc: Scenario) -> str:
         return (f"n={sc.n} H={sc.max_work_h:g}h v={sc.speed_kmh:g}km/h "
                 f"優先{sc.prio_pct:g}% μ={sc.mu:g}")
+
+
+def _experiment_job(args):
+    """並列実行用ワーカー（picklable にするためトップレベル定義）"""
+    sc, seed = args
+    return ExperimentRunner().run_one(sc, seed)
 
 
 # ── 必要人数分析 ──────────────────────────────────────────────────────────────
@@ -428,6 +466,8 @@ def main():
                     choices=["noise", "staffing", "sweep", "tornado"])
     ap.add_argument("--n", type=int, default=200, help="建物数")
     ap.add_argument("--seeds", type=int, default=5, help="シード数")
+    ap.add_argument("--workers", type=int, default=1,
+                    help="並列実行数（推奨: 物理コア数まで）")
     ap.add_argument("--time-limit", type=float, default=30.0,
                     help="OR-Tools 時間制限 [秒]")
     ap.add_argument("--mu", type=float, default=1.0, help="優先の重み μ")
@@ -446,9 +486,10 @@ def main():
     base = _base_from_args(a)
     seeds = list(range(a.seeds))
     tag = f"n{a.n}_s{a.seeds}"
+    runner = ExperimentRunner(print, n_workers=a.workers)
 
     if a.command == "noise":
-        sa = SensitivityAnalyzer(base, seeds)
+        sa = SensitivityAnalyzer(base, seeds, runner)
         stats = sa.noise_floor(os.path.join(RESULTS_DIR, f"noise_{tag}.csv"))
         print("\n── ノイズ床（同一条件・シードのみ変更）──")
         for k, s in stats.items():
@@ -459,7 +500,7 @@ def main():
 
     elif a.command == "staffing":
         hs = [float(x) for x in a.h.split(",")]
-        st = StaffingAnalyzer(base)
+        st = StaffingAnalyzer(base, runner)
         rows = st.run(hs, seeds,
                       os.path.join(RESULTS_DIR, f"staffing_{tag}.csv"))
         png = os.path.join(RESULTS_DIR, f"staffing_{tag}.png")
@@ -477,7 +518,7 @@ def main():
         if not a.param or not a.values:
             ap.error("sweep には --param と --values が必要です")
         vals = [float(x) for x in a.values.split(",")]
-        sa = SensitivityAnalyzer(base, seeds)
+        sa = SensitivityAnalyzer(base, seeds, runner)
         rows = sa.sweep(a.param, vals,
                         os.path.join(RESULTS_DIR,
                                      f"sweep_{a.param}_{tag}.csv"))
@@ -486,7 +527,7 @@ def main():
         print(f"図: {png}")
 
     elif a.command == "tornado":
-        sa = SensitivityAnalyzer(base, seeds)
+        sa = SensitivityAnalyzer(base, seeds, runner)
         effects = sa.tornado(
             rel=a.rel, output=a.output,
             csv_path=os.path.join(RESULTS_DIR, f"tornado_{tag}.csv"))
