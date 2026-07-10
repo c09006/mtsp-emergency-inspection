@@ -60,6 +60,7 @@ python tsp_gui.py
 | `tsp_gui.py` | tkinter + matplotlib による計画作成 GUI |
 | `compare_gui.py` | ソルバー比較ツール。同一インスタンスを貪欲法と OR-Tools の両方で解き、ルート図と指標を並べて表示。結果を `comparison_results.csv` に追記できる |
 | `experiments.py` | 実験基盤（CLI）。規定時間 H ごとの最小必要人数分析（`StaffingAnalyzer`）と、ノイズ床測定・One-at-a-Time・トルネード図による感度分析（`SensitivityAnalyzer`）。結果は `results/` に CSV + PNG で保存 |
+| `experiment_gui.py` | 実験ツールの GUI フロントエンド。4種類の実験（ノイズ床・必要人数曲線・スイープ・トルネード）をフォームで設定・実行し、進捗ログとグラフを画面内に表示。中止しても完了分は CSV に保存される |
 
 `mtsp_core.py` は「問題」「解」「解法」を分離したクラス構成になっています:
 

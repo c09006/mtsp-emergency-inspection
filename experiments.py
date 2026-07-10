@@ -106,8 +106,10 @@ class ExperimentRunner:
     3. 両者の全指標を記録する
     """
 
-    def __init__(self, status_cb: Optional[Callable[[str], None]] = None):
+    def __init__(self, status_cb: Optional[Callable[[str], None]] = None,
+                 should_continue: Optional[Callable[[], bool]] = None):
         self.status_cb = status_cb or (lambda msg: None)
+        self.should_continue = should_continue or (lambda: True)
 
     def run_one(self, sc: Scenario, seed: int) -> Optional[dict]:
         self.status_cb(f"  seed={seed}: 問題生成・貪欲法二分探索...")
@@ -176,6 +178,9 @@ class ExperimentRunner:
         f = None
         try:
             for i, (sc, seed) in enumerate(scenarios, 1):
+                if not self.should_continue():
+                    self.status_cb("中止されました（完了分は保存済み）")
+                    break
                 self.status_cb(f"[{i}/{total}] {self._label(sc)}")
                 row = self.run_one(sc, seed)
                 if row is None:
@@ -225,8 +230,11 @@ class StaffingAnalyzer:
         return self.runner.run_many(jobs, csv_path)
 
     @staticmethod
-    def plot(rows: list, path: str):
-        """H vs 必要人数（平均 ± 標準偏差）を描画して保存する"""
+    def plot(rows: list, path: Optional[str] = None, fig=None):
+        """
+        H vs 必要人数（平均 ± 標準偏差）を描画する。
+        fig を渡すとそこへ描画（GUI 埋め込み用）、path を渡すと PNG 保存。
+        """
         hs = sorted({r["max_work_h"] for r in rows})
 
         def stats(key):
@@ -240,7 +248,10 @@ class StaffingAnalyzer:
         gm, gs = stats("greedy_min_m")
         om, os_ = stats("opt_used")
 
-        fig, ax = plt.subplots(figsize=(8, 5.5))
+        own = fig is None
+        if own:
+            fig = plt.figure(figsize=(8, 5.5))
+        ax = fig.add_subplot(111)
         ax.errorbar(hs, gm, yerr=gs, marker="o", capsize=4,
                     label="貪欲法の最小人数", color="#e74c3c")
         ax.errorbar(hs, om, yerr=os_, marker="s", capsize=4,
@@ -253,9 +264,11 @@ class StaffingAnalyzer:
         ax.grid(alpha=0.3)
         ax.legend()
         fig.tight_layout()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        fig.savefig(path, dpi=120)
-        plt.close(fig)
+        if path:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            fig.savefig(path, dpi=120)
+        if own:
+            plt.close(fig)
 
 
 # ── 感度分析 ──────────────────────────────────────────────────────────────────
@@ -336,8 +349,9 @@ class SensitivityAnalyzer:
         return effects
 
     @staticmethod
-    def plot_sweep(rows: list, param: str, path: str,
-                   outputs=("opt_used", "opt_total_h", "opt_prio_start_h")):
+    def plot_sweep(rows: list, param: str, path: Optional[str] = None,
+                   outputs=("opt_used", "opt_total_h", "opt_prio_start_h"),
+                   fig=None):
         """sweep の結果（平均±SD）をパラメータ別に描画する"""
         labels = {"opt_used": "必要人数 [人]",
                   "opt_total_h": "総活動時間 [h]",
@@ -345,10 +359,11 @@ class SensitivityAnalyzer:
                   "opt_makespan_h": "makespan [h]",
                   "greedy_min_m": "貪欲法 最小人数 [人]"}
         vals = sorted({r[param] for r in rows})
-        fig, axes = plt.subplots(1, len(outputs),
-                                 figsize=(5 * len(outputs), 4.4))
-        if len(outputs) == 1:
-            axes = [axes]
+        own = fig is None
+        if own:
+            fig = plt.figure(figsize=(5 * len(outputs), 4.4))
+        axes = [fig.add_subplot(1, len(outputs), i + 1)
+                for i in range(len(outputs))]
         for ax, key in zip(axes, outputs):
             means, stds = [], []
             for v in vals:
@@ -364,18 +379,24 @@ class SensitivityAnalyzer:
             ax.grid(alpha=0.3)
         fig.suptitle(f"感度分析: {param} を変化させた影響（平均±SD）")
         fig.tight_layout()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        fig.savefig(path, dpi=120)
-        plt.close(fig)
+        if path:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            fig.savefig(path, dpi=120)
+        if own:
+            plt.close(fig)
 
     @staticmethod
-    def plot_tornado(effects: list, output: str, rel: float, path: str):
+    def plot_tornado(effects: list, output: str, rel: float,
+                     path: Optional[str] = None, fig=None):
         """tornado() の結果を横棒グラフで描画する"""
         names = {"speed_kmh": "移動速度", "t_min": "判定時間 最小",
                  "t_max": "判定時間 最大", "area_km": "エリアサイズ",
                  "prio_pct": "優先建物割合", "max_work_h": "規定時間 H",
                  "mu": "μ（優先の重み）", "n": "建物数"}
-        fig, ax = plt.subplots(figsize=(8, 0.7 * len(effects) + 2))
+        own = fig is None
+        if own:
+            fig = plt.figure(figsize=(8, 0.7 * len(effects) + 2))
+        ax = fig.add_subplot(111)
         for i, (p, base, lo, hi) in enumerate(reversed(effects)):
             ax.barh(i, lo - base, left=base, color="#3498db", height=0.6)
             ax.barh(i, hi - base, left=base, color="#e74c3c", height=0.6)
@@ -387,9 +408,11 @@ class SensitivityAnalyzer:
                      f"（青=下振れ側, 赤=上振れ側, 縦線=ベースライン）")
         ax.grid(alpha=0.3, axis="x")
         fig.tight_layout()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        fig.savefig(path, dpi=120)
-        plt.close(fig)
+        if path:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            fig.savefig(path, dpi=120)
+        if own:
+            plt.close(fig)
 
 
 # ── コマンドラインインターフェース ────────────────────────────────────────────
