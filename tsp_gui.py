@@ -502,15 +502,36 @@ class TSPApp:
             self.ax.scatter(coords[:, 0], coords[:, 1],
                             c="#76ff03", s=size, alpha=0.75, zorder=3)
 
-        # 優先建物をシアンの二重丸で強調表示
+        # 優先建物を二重丸で強調表示（検査済み=シアン、未検査=赤）
         if self.priorities and len(self.priorities) == n:
             pr = np.array(self.priorities)
             if pr.any():
-                pc = coords[pr > 0]
-                self.ax.scatter(pc[:, 0], pc[:, 1],
-                                facecolors="none", edgecolors="#00e5ff",
-                                s=max(30, 60 - n // 100), linewidths=1.2,
-                                zorder=5, label=f"優先建物 ({len(pc)})")
+                size = max(30, 60 - n // 100)
+                prio_mask = pr > 0
+                if (self.solution is not None
+                        and self.solution.problem.n_buildings == n):
+                    a = self.solution.arrival_times
+                    done = prio_mask & ~np.isnan(a)
+                    pend = prio_mask & np.isnan(a)
+                    pend[self.depot_idx] = False
+                    if done.any():
+                        dc = coords[done]
+                        self.ax.scatter(dc[:, 0], dc[:, 1],
+                                        facecolors="none", edgecolors="#00e5ff",
+                                        s=size, linewidths=1.2, zorder=5,
+                                        label=f"優先建物 検査済 ({done.sum()})")
+                    if pend.any():
+                        pc = coords[pend]
+                        self.ax.scatter(pc[:, 0], pc[:, 1],
+                                        facecolors="none", edgecolors="#ff1744",
+                                        s=size * 1.6, linewidths=1.8, zorder=5,
+                                        label=f"優先建物 未検査 ({pend.sum()})")
+                else:
+                    pc = coords[prio_mask]
+                    self.ax.scatter(pc[:, 0], pc[:, 1],
+                                    facecolors="none", edgecolors="#00e5ff",
+                                    s=size, linewidths=1.2, zorder=5,
+                                    label=f"優先建物 ({prio_mask.sum()})")
 
         # デポを金色の星マークで表示
         dep = self.depot_idx if self.nodes else 0
@@ -566,9 +587,9 @@ class TSPApp:
 
         # 優先建物の統計
         prio_mask  = p.priorities > 0
-        n_prio     = int(prio_mask.sum())
+        n_prio     = sol.n_priority
+        prio_done  = sol.n_priority_done
         a          = sol.arrival_times
-        prio_done  = int(np.sum(prio_mask & ~np.isnan(a)))
         prio_mean  = (float(np.nanmean(a[prio_mask]))
                       if prio_done > 0 else None)
         all_mean   = (float(np.nanmean(a)) if n_inspected > 0 else None)
@@ -594,13 +615,20 @@ class TSPApp:
         avg_t = (sum(used) / len(used)) if used else 0.0
         avg_d = (sol.total_dist / sol.n_used) if sol.n_used else 0.0
 
+        prio_rate = prio_done / n_prio * 100 if n_prio else 0.0
+        prio_left = n_prio - prio_done
         lines = [
             "■ 建物",
             f"  検査対象（デポ除く）: {n_total:,} 棟",
             f"  検査済み            : {n_inspected:,} 棟 ({rate:.1f}%)",
             f"  未割当              : {n_unassign:,} 棟",
-            f"  優先建物            : {n_prio:,} 棟（検査済み {prio_done:,} 棟）",
+            f"  優先建物            : {n_prio:,} 棟",
+            f"    検査済み          : {prio_done:,} 棟 ({prio_rate:.1f}%)"
+            + ("  ← 全て検査済み" if n_prio and prio_left == 0 else ""),
         ]
+        if prio_left > 0:
+            lines.append(f"    未検査            : {prio_left:,} 棟 "
+                         f"※地図上で赤丸表示")
         if prio_mean is not None:
             lines.append(f"  優先建物の平均判定開始: {prio_mean:.2f} h"
                          + (f"（全体平均 {all_mean:.2f} h）" if all_mean else ""))

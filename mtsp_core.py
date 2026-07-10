@@ -225,6 +225,29 @@ class InspectionSolution:
         mask = ~np.isnan(a)
         return float((self.problem.priorities[mask] * a[mask]).sum())
 
+    @property
+    def n_priority(self) -> int:
+        """優先建物の総数（デポを除く）"""
+        p = self.problem
+        mask = p.priorities > 0
+        mask[p.depot_idx] = False
+        return int(mask.sum())
+
+    @property
+    def n_priority_done(self) -> int:
+        """検査された（ルートに含まれる）優先建物の数"""
+        a = self.arrival_times
+        return int(((self.problem.priorities > 0) & ~np.isnan(a)).sum())
+
+    @property
+    def priority_unassigned(self) -> list:
+        """未検査（未割当）の優先建物インデックスのリスト"""
+        p = self.problem
+        a = self.arrival_times
+        return [i for i in range(p.n_buildings)
+                if p.priorities[i] > 0 and i != p.depot_idx
+                and np.isnan(a[i])]
+
     def objective(self, weight_m: float, weight_total: float,
                   weight_priority: float) -> float:
         """目的関数値 M Σz_q + λ ΣT_q + μ Σp_i a_i を返す"""

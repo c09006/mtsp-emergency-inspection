@@ -285,10 +285,21 @@ class CompareApp:
             ax.scatter(coords[:, 0], coords[:, 1], c="#cccccc", s=10,
                        alpha=0.8, zorder=3)
             if prio_mask.any():
-                pc = coords[prio_mask]
-                ax.scatter(pc[:, 0], pc[:, 1], facecolors="none",
-                           edgecolors="#00e5ff", s=60, linewidths=1.4,
-                           zorder=5, label="優先建物")
+                # 優先建物: 検査済み=シアン、未検査=赤で区別
+                a = sol.arrival_times
+                done = prio_mask & ~np.isnan(a)
+                pend = prio_mask & np.isnan(a)
+                pend[depot] = False
+                if done.any():
+                    dc = coords[done]
+                    ax.scatter(dc[:, 0], dc[:, 1], facecolors="none",
+                               edgecolors="#00e5ff", s=60, linewidths=1.4,
+                               zorder=5, label=f"優先 検査済 ({done.sum()})")
+                if pend.any():
+                    pc = coords[pend]
+                    ax.scatter(pc[:, 0], pc[:, 1], facecolors="none",
+                               edgecolors="#ff1744", s=95, linewidths=1.8,
+                               zorder=5, label=f"優先 未検査 ({pend.sum()})")
             ax.scatter([coords[depot, 0]], [coords[depot, 1]], c="#FFD700",
                        s=220, marker="*", zorder=6, label="デポ")
             ax.legend(loc="upper right", fontsize=8,
@@ -324,6 +335,12 @@ class CompareApp:
             ("総活動時間 ΣT_q [h]",
              f"{g.total_time:.2f}", f"{o.total_time:.2f}",
              diff(g.total_time, o.total_time, pct=True)),
+            ("優先建物 検査済み [棟]",
+             f"{g.n_priority_done}/{g.n_priority}",
+             f"{o.n_priority_done}/{o.n_priority}",
+             "―" if g.n_priority_done == o.n_priority_done
+             else ("▲" if o.n_priority_done > g.n_priority_done else "▽")
+             + f" {o.n_priority_done - g.n_priority_done:+d}"),
             ("優先建物 平均判定開始 [h]",
              "-" if pg is None else f"{pg:.2f}",
              "-" if po is None else f"{po:.2f}",
@@ -374,10 +391,12 @@ class CompareApp:
         header = [
             "datetime", "n", "area_km", "prio_pct", "m_limit",
             "time_limit", "M", "lambda", "mu", "seed",
-            "greedy_used", "greedy_total_h", "greedy_prio_start_h",
+            "greedy_used", "greedy_total_h",
+            "greedy_prio_done", "greedy_prio_total", "greedy_prio_start_h",
             "greedy_makespan_h", "greedy_dist_km", "greedy_unassigned",
             "greedy_objective", "greedy_sec",
-            "opt_used", "opt_total_h", "opt_prio_start_h",
+            "opt_used", "opt_total_h",
+            "opt_prio_done", "opt_prio_total", "opt_prio_start_h",
             "opt_makespan_h", "opt_dist_km", "opt_unassigned",
             "opt_objective", "opt_sec", "objective_gain_pct",
         ]
@@ -389,16 +408,28 @@ class CompareApp:
             res["m_limit"], params["time_limit"], w_m, w_l, w_p,
             params["seed"] if params["seed"] is not None else "",
             g.n_used, round(g.total_time, 3),
+            g.n_priority_done, g.n_priority,
             "" if pg is None else round(pg, 3),
             round(g.makespan, 3), round(g.total_dist, 1),
             g.n_unassigned, round(obj_g, 1), round(res["t_greedy"], 2),
             o.n_used, round(o.total_time, 3),
+            o.n_priority_done, o.n_priority,
             "" if po is None else round(po, 3),
             round(o.makespan, 3), round(o.total_dist, 1),
             o.n_unassigned, round(obj_o, 1), round(res["t_opt"], 2),
             round((1 - obj_o / obj_g) * 100, 2) if obj_g > 0 else "",
         ]
+        # 列構成が古い CSV が残っていたらバックアップして新規作成する
         new_file = not os.path.exists(CSV_PATH)
+        if not new_file:
+            with open(CSV_PATH, encoding="utf-8-sig") as f:
+                first = f.readline()
+            if "greedy_prio_done" not in first:
+                backup = CSV_PATH.replace(
+                    ".csv",
+                    datetime.datetime.now().strftime("_old_%Y%m%d%H%M%S.csv"))
+                os.rename(CSV_PATH, backup)
+                new_file = True
         with open(CSV_PATH, "a", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)
             if new_file:
