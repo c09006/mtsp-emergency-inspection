@@ -59,6 +59,8 @@ class TSPApp:
         self.n_cpu        = os.cpu_count() or 4
         self.depot_mode_var = tk.StringVar(value="center")
         self.solver_var     = tk.StringVar(value="greedy")
+        self.last_elapsed   = None   # 直近の計算時間 [秒]
+        self.last_solver    = None   # 直近に使ったソルバー名
 
         self._build_ui()
 
@@ -170,6 +172,11 @@ class TSPApp:
                                       fg="#333", anchor="w", wraplength=270,
                                       justify=tk.LEFT)
         self.stat_status.pack(fill=tk.X)
+
+        self.summary_btn = tk.Button(
+            ctrl, text="サマリーを表示", command=self.show_summary,
+            bg="#455A64", fg="white", relief=tk.FLAT, pady=3)
+        self.summary_btn.pack(fill=tk.X, pady=2)
 
         # 判定士ごとの稼働時間・移動距離テーブル
         self.per_text = tk.Text(ctrl, height=7, font=("Courier", 8),
@@ -347,8 +354,10 @@ class TSPApp:
         self.m_var.set(str(min_m))  # 判定士数入力欄に反映
 
         if sol:
-            self.solution  = sol
-            self.depot_idx = sol.problem.depot_idx
+            self.solution     = sol
+            self.depot_idx    = sol.problem.depot_idx
+            self.last_elapsed = elapsed
+            self.last_solver  = "貪欲法（最小人数の二分探索）"
             h = int(sol.makespan); mn = int((sol.makespan - h) * 60)
             self.stat_makespan.config(text=f"最大終了時間: {h}h{mn:02d}m")
             self.stat_unassign.config(text="未割当建物: 0 棟 (全棟完了)",
@@ -498,6 +507,108 @@ class TSPApp:
                     tk.END, f"  #{i+1:2d}   {t:>11.3f}  {d_str}\n")
         self.per_text.config(state=tk.DISABLED)
 
+    # ── サマリー ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _fmt_hm(hours):
+        """時間 [h] を「XhYYm」形式の文字列にする"""
+        total_min = int(round(hours * 60))
+        return f"{total_min // 60}h{total_min % 60:02d}m"
+
+    def show_summary(self):
+        """直近の計画のサマリー（建物・体制・時間・日数・コスト）を表示する"""
+        if self.solution is None:
+            messagebox.showinfo("サマリー", "先に「計画を実行」してください")
+            return
+        sol = self.solution
+        p   = sol.problem
+        try:
+            w_m = float(self.wm_var.get())
+            w_l = float(self.wl_var.get())
+            w_p = float(self.wp_var.get())
+        except Exception:
+            w_m, w_l, w_p = 1000.0, 1.0, 1.0
+
+        n_total     = p.n_buildings - 1            # デポを除いた検査対象数
+        n_inspected = sum(len(r) - 2 for r in sol.routes)
+        n_unassign  = sol.n_unassigned
+        rate        = n_inspected / n_total * 100 if n_total else 0.0
+
+        # 優先建物の統計
+        prio_mask  = p.priorities > 0
+        n_prio     = int(prio_mask.sum())
+        a          = sol.arrival_times
+        prio_done  = int(np.sum(prio_mask & ~np.isnan(a)))
+        prio_mean  = (float(np.nanmean(a[prio_mask]))
+                      if prio_done > 0 else None)
+        all_mean   = (float(np.nanmean(a)) if n_inspected > 0 else None)
+
+        # 所要日数の推定: この計画を 1 日分として、同じペースで
+        # 全棟を検査し終えるまでの日数（未割当ゼロなら 1 日）
+        if n_unassign == 0:
+            days_txt = "1 日で全棟完了"
+        elif n_inspected > 0:
+            est_days = int(np.ceil(n_total / n_inspected))
+            days_txt = (f"約 {est_days} 日 "
+                        f"(1日 {n_inspected:,} 棟のペースで全 {n_total:,} 棟)")
+        else:
+            days_txt = "算出不可（検査済み 0 棟）"
+
+        # 目的関数コストの内訳
+        cost_m   = w_m * sol.n_used
+        cost_l   = w_l * sol.total_time
+        cost_p   = w_p * sol.priority_cost
+        cost_sum = cost_m + cost_l + cost_p
+
+        used  = [t for t in sol.per_time if t > 0]
+        avg_t = (sum(used) / len(used)) if used else 0.0
+        avg_d = (sol.total_dist / sol.n_used) if sol.n_used else 0.0
+
+        lines = [
+            "■ 建物",
+            f"  検査対象（デポ除く）: {n_total:,} 棟",
+            f"  検査済み            : {n_inspected:,} 棟 ({rate:.1f}%)",
+            f"  未割当              : {n_unassign:,} 棟",
+            f"  優先建物            : {n_prio:,} 棟（検査済み {prio_done:,} 棟）",
+        ]
+        if prio_mean is not None:
+            lines.append(f"  優先建物の平均判定開始: {prio_mean:.2f} h"
+                         + (f"（全体平均 {all_mean:.2f} h）" if all_mean else ""))
+        lines += [
+            "",
+            "■ 体制・時間",
+            f"  判定士              : 使用 {sol.n_used} 人 / 上限 {sol.n_inspectors} 人",
+            f"  最大終了時間        : {self._fmt_hm(sol.makespan)}"
+            f"（稼働上限 {p.max_work_h:g} h）",
+            f"  総活動時間 ΣT_q     : {sol.total_time:.2f} h",
+            f"  平均稼働時間        : {avg_t:.2f} h/人",
+            f"  総移動距離          : {sol.total_dist:.1f} km"
+            f"（平均 {avg_d:.1f} km/人）",
+            "",
+            "■ 所要日数（推定）",
+            f"  {days_txt}",
+            "",
+            "■ コスト（目的関数）  min MΣz + λΣT + μΣp·a",
+            f"  人数     M Σz_q  (M={w_m:g}) : {cost_m:,.1f}",
+            f"  総活動   λ ΣT_q  (λ={w_l:g}) : {cost_l:,.1f}",
+            f"  優先     μ Σp·a  (μ={w_p:g}) : {cost_p:,.1f}",
+            f"  {'─' * 30}",
+            f"  合計                : {cost_sum:,.1f}",
+            "",
+            "■ 計算",
+            f"  ソルバー            : {self.last_solver or '-'}",
+            f"  計算時間            : "
+            + (f"{self.last_elapsed:.2f} 秒" if self.last_elapsed else "-"),
+        ]
+
+        win = tk.Toplevel(self.root)
+        win.title("計画サマリー")
+        win.geometry("460x560")
+        txt = tk.Text(win, font=("Courier", 10), padx=10, pady=8)
+        txt.pack(fill=tk.BOTH, expand=True)
+        txt.insert(tk.END, "\n".join(lines))
+        txt.config(state=tk.DISABLED)
+
     # ── ソルバー実行 ─────────────────────────────────────────────────────────
 
     def solve_tsp(self):
@@ -608,9 +719,12 @@ class TSPApp:
             self.stat_status.config(text="状態: 失敗")
             return
 
-        self.solution  = sol
-        self.depot_idx = sol.problem.depot_idx
-        n_unassigned   = sol.n_unassigned
+        self.solution     = sol
+        self.depot_idx    = sol.problem.depot_idx
+        self.last_elapsed = elapsed
+        self.last_solver  = ("貪欲法 + OR-Tools最適化"
+                             if self.solver_var.get() == "ortools" else "貪欲法")
+        n_unassigned      = sol.n_unassigned
 
         self.stat_m.config(
             text=f"判定士数: 使用 {sol.n_used} / 上限 {sol.n_inspectors} "
