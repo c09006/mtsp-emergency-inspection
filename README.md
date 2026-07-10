@@ -59,6 +59,7 @@ python tsp_gui.py
 | `mtsp_core.py` | ソルバー本体（GUI 非依存）。単体で import して利用可能 |
 | `tsp_gui.py` | tkinter + matplotlib による計画作成 GUI |
 | `compare_gui.py` | ソルバー比較ツール。同一インスタンスを貪欲法と OR-Tools の両方で解き、ルート図と指標を並べて表示。結果を `comparison_results.csv` に追記できる |
+| `experiments.py` | 実験基盤（CLI）。規定時間 H ごとの最小必要人数分析（`StaffingAnalyzer`）と、ノイズ床測定・One-at-a-Time・トルネード図による感度分析（`SensitivityAnalyzer`）。結果は `results/` に CSV + PNG で保存 |
 
 `mtsp_core.py` は「問題」「解」「解法」を分離したクラス構成になっています:
 
