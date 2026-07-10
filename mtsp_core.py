@@ -14,9 +14,10 @@
 
 【制約条件】
 1. 各建物は 1 回だけ判定
-2. 判定士は拠点（デポ）から出発・拠点に帰還
+2. 判定士は毎日、拠点（デポ）から出発し拠点に帰還する
 3. 移動時間（距離 / 速度）と判定時間を稼働時間に加算
-4. 現在時刻 + 移動 + 判定 + デポ帰還 ≤ 最大稼働時間 を満たす場合のみ割当
+4. 1 日の稼働は 最大稼働時間 max_work_h 以内
+5. 計画は期日 n_days 日以内（日ごとに独立したルートを持つ）
 
 【目的関数（ORToolsSolver）】
     min  M Σ z_q  +  λ Σ T_q  +  μ Σ p_i a_i
@@ -55,8 +56,9 @@ class InspectionProblem:
         depot_idx     : デポ（拠点）の建物インデックス
         area_km       : エリア一辺の実寸 [km]
         speed_kmh     : 判定士の移動速度 [km/h]
-        max_work_h    : 判定士 1 人あたりの最大稼働時間 [時間]
+        max_work_h    : 判定士 1 人・1 日あたりの最大稼働時間 [時間]
         priorities    : (n,) 建物ごとの優先度 p_i（0 = 通常）。省略時は全建物 0
+        n_days        : 期日（計画日数）。判定士は毎日デポから出発・帰還する
     """
     coords: np.ndarray
     inspect_times: np.ndarray
@@ -65,6 +67,7 @@ class InspectionProblem:
     speed_kmh: float
     max_work_h: float
     priorities: Optional[np.ndarray] = None
+    n_days: int = 1
 
     def __post_init__(self):
         coords = np.asarray(self.coords, dtype=np.float64)
@@ -86,6 +89,9 @@ class InspectionProblem:
             raise ValueError(f"depot_idx={self.depot_idx} が範囲外です")
         if self.area_km <= 0 or self.speed_kmh <= 0 or self.max_work_h <= 0:
             raise ValueError("area_km / speed_kmh / max_work_h は正の値が必要です")
+        if not (1 <= int(self.n_days) <= 365):
+            raise ValueError("n_days（期日日数）は 1〜365 の整数が必要です")
+        object.__setattr__(self, "n_days", int(self.n_days))
 
     @property
     def n_buildings(self) -> int:
@@ -122,7 +128,7 @@ class InspectionProblem:
         return InspectionProblem(
             self.coords, self.inspect_times, depot_idx,
             self.area_km, self.speed_kmh, self.max_work_h,
-            self.priorities)
+            self.priorities, self.n_days)
 
 
 # ── 解 ────────────────────────────────────────────────────────────────────────
@@ -135,17 +141,35 @@ class InspectionSolution:
     is_feasible() / validate() で制約充足を検証できるのが要点。
 
     Attributes:
-        problem    : 対応する問題インスタンス
-        routes     : 判定士ごとの訪問順インデックス（デポ始点・デポ終点）
-        unassigned : 時間不足で割当できなかった建物インデックスのリスト
+        problem          : 対応する問題インスタンス
+        routes           : ルートごとの訪問順インデックス（デポ始点・デポ終点）。
+                           複数日計画では 1 ルート = 1 判定士の 1 日分
+        unassigned       : 期日内に割当できなかった建物インデックスのリスト
+        route_days       : 各ルートの実施日（0 始まり）。None なら全て 0 日目
+        route_inspectors : 各ルートの担当判定士 ID。None なら通し番号
     """
     problem: InspectionProblem
     routes: list = field(default_factory=list)
     unassigned: list = field(default_factory=list)
+    route_days: Optional[list] = None
+    route_inspectors: Optional[list] = None
+
+    @property
+    def route_day(self) -> list:
+        """各ルートの実施日（0 始まり）"""
+        return (self.route_days if self.route_days is not None
+                else [0] * len(self.routes))
+
+    @property
+    def route_inspector(self) -> list:
+        """各ルートの担当判定士 ID"""
+        return (self.route_inspectors if self.route_inspectors is not None
+                else list(range(len(self.routes))))
 
     @property
     def n_inspectors(self) -> int:
-        return len(self.routes)
+        """判定士数（上限）= 相異なる担当者 ID の数"""
+        return len(set(self.route_inspector)) if self.routes else 0
 
     @cached_property
     def per_time(self) -> list:
@@ -193,8 +217,27 @@ class InspectionSolution:
 
     @property
     def n_used(self) -> int:
-        """実際に建物を割り当てられた（使用された）判定士数 Σz_q"""
+        """
+        必要判定士数 = 日ごとの使用人数の最大値。
+        判定士は日をまたいで使い回せるため、最も人手が要る日の人数が
+        「実際に確保すべき人数」になる（単日計画では従来どおり使用人数）。
+        """
+        per_day = {}
+        for d, r in zip(self.route_day, self.routes):
+            if len(r) > 2:
+                per_day[d] = per_day.get(d, 0) + 1
+        return max(per_day.values()) if per_day else 0
+
+    @property
+    def person_days(self) -> int:
+        """延べ人日 = 建物が割り当てられたルート（判定士×日）の数"""
         return sum(1 for r in self.routes if len(r) > 2)
+
+    @property
+    def n_days_used(self) -> int:
+        """実際に使われた日数（建物が割り当てられた最終日 + 1）"""
+        used = [d for d, r in zip(self.route_day, self.routes) if len(r) > 2]
+        return max(used) + 1 if used else 0
 
     @property
     def total_time(self) -> float:
@@ -205,13 +248,14 @@ class InspectionSolution:
     def arrival_times(self) -> np.ndarray:
         """
         建物ごとの判定開始時刻 a_i [時間]。未訪問（デポ・未割当）は NaN。
-        a_i = デポ出発からの累積（移動 + それまでの判定）で、建物 i の
-        判定を開始する時刻。
+        a_i = 実施日のオフセット（d 日目 = 24d 時間）+ その日のデポ出発
+        からの累積（移動 + それまでの判定）。複数日計画では「後の日ほど
+        遅い」が自然に表現される。
         """
         p = self.problem
         a = np.full(p.n_buildings, np.nan)
-        for route in self.routes:
-            t = 0.0
+        for day, route in zip(self.route_day, self.routes):
+            t = day * 86400.0   # 日オフセット [秒]
             for k in range(1, len(route) - 1):
                 t += p.travel_sec(route[k - 1], route[k])
                 a[route[k]] = t / 3600.0
@@ -282,7 +326,9 @@ class InspectionSolution:
         return not self.validate(tol)
 
     def summary(self) -> str:
-        return (f"判定士 {self.n_used}/{self.n_inspectors} 人 | "
+        days = (f" | {self.n_days_used}/{self.problem.n_days} 日"
+                if self.problem.n_days > 1 else "")
+        return (f"判定士 {self.n_used}/{self.n_inspectors} 人{days} | "
                 f"makespan {self.makespan:.3f}h | 総活動 {self.total_time:.2f}h | "
                 f"優先コスト {self.priority_cost:.2f} | "
                 f"総距離 {self.total_dist:.1f}km | 未割当 {self.n_unassigned} 棟")
@@ -290,9 +336,9 @@ class InspectionSolution:
 
 # ── 貪欲法の実体（ProcessPoolExecutor で並列実行するためトップレベルに定義）──
 
-def _greedy_routes(problem: InspectionProblem, m: int):
+def _greedy_routes(problem: InspectionProblem, m: int, visited=None):
     """
-    時間制約付き mTSP 貪欲法。
+    時間制約付き mTSP 貪欲法（1 日分）。
 
     【割当戦略】
     min-heap で「現在時刻が最も小さい（最も暇な）判定士」が次の建物を選ぶ。
@@ -325,7 +371,8 @@ def _greedy_routes(problem: InspectionProblem, m: int):
     # KDTree を構築（近傍探索を O(log n) で実現）
     tree = KDTree(coords)
 
-    visited = np.zeros(n, dtype=bool)
+    if visited is None:
+        visited = np.zeros(n, dtype=bool)
     visited[depot_idx] = True   # デポは最初から訪問済み扱い
 
     # min-heap: (現在時刻[秒], 判定士ID)
@@ -339,7 +386,7 @@ def _greedy_routes(problem: InspectionProblem, m: int):
 
     # 初回クエリの近傍数。未訪問が見つからなければ段階的に拡大
     k_base = min(30, n)
-    remaining = n - 1   # デポを除いた未割当建物数
+    remaining = int((~visited).sum())   # 未割当建物数
 
     while remaining > 0:
         if all(done):
@@ -389,10 +436,38 @@ def _greedy_routes(problem: InspectionProblem, m: int):
     return routes, unassigned
 
 
+def _greedy_multi_day(problem: InspectionProblem, m: int):
+    """
+    期日 n_days 日の複数日貪欲法。
+
+    日ごとに「残りの建物」へ 1 日分の貪欲法を適用する。判定士は毎日
+    デポから出発・帰還し、期日を使い切っても残った建物が未割当になる。
+
+    Returns:
+        (routes, route_days, route_inspectors, unassigned)
+    """
+    n = problem.n_buildings
+    visited = np.zeros(n, dtype=bool)
+    routes, route_days, route_inspectors = [], [], []
+
+    for d in range(problem.n_days):
+        day_routes, _ = _greedy_routes(problem, m, visited)
+        assigned = sum(len(r) - 2 for r in day_routes)
+        routes += day_routes
+        route_days += [d] * m
+        route_inspectors += list(range(m))
+        if assigned == 0 or visited.all():
+            break   # 割当できる建物が残っていない
+
+    unassigned = [i for i in range(n)
+                  if not visited[i] and i != problem.depot_idx]
+    return routes, route_days, route_inspectors, unassigned
+
+
 def _greedy_worker(args):
     """ProcessPoolExecutor 用ワーカー（picklable にするためトップレベル定義）"""
     problem, m = args
-    return _greedy_routes(problem, m)
+    return _greedy_multi_day(problem, m)
 
 
 # ── 解法 ──────────────────────────────────────────────────────────────────────
@@ -411,8 +486,9 @@ class GreedySolver(SolverBase):
     def solve(self, problem: InspectionProblem, m: int) -> InspectionSolution:
         if m < 1:
             raise ValueError("判定士数 m は 1 以上が必要です")
-        routes, unassigned = _greedy_routes(problem, m)
-        return InspectionSolution(problem, routes, unassigned)
+        routes, days, inspectors, unassigned = _greedy_multi_day(problem, m)
+        return InspectionSolution(problem, routes, unassigned,
+                                  days, inspectors)
 
 
 class MultiStartSolver(SolverBase):
@@ -443,8 +519,9 @@ class MultiStartSolver(SolverBase):
             with ProcessPoolExecutor(max_workers=self.n_workers) as ex:
                 futs = {ex.submit(_greedy_worker, (p, m)): p for p in problems}
                 for f in as_completed(futs):
-                    routes, unassigned = f.result()
-                    solutions.append(InspectionSolution(futs[f], routes, unassigned))
+                    routes, days, inspectors, unassigned = f.result()
+                    solutions.append(InspectionSolution(
+                        futs[f], routes, unassigned, days, inspectors))
 
         return min(solutions,
                    key=lambda s: (s.n_unassigned, s.makespan, s.total_dist))
@@ -509,6 +586,9 @@ class ORToolsSolver(SolverBase):
                 f"大規模問題には GreedySolver を使用してください")
 
         depot = problem.depot_idx
+        n_days = problem.n_days
+        n_vehicles = m * n_days   # 1 車両 = 1 判定士の 1 日分
+        DAY_SEC = 86400
 
         # 時間行列 [秒, 整数]。切り上げにより「整数モデルで実行可能なら
         # 実数値の稼働時間制約も必ず満たす」ことを保証する
@@ -520,7 +600,7 @@ class ORToolsSolver(SolverBase):
         service[depot] = 0          # デポ（拠点）自体は判定しない
         max_work_sec = int(problem.max_work_h * 3600)
 
-        manager = pywrapcp.RoutingIndexManager(n, m, depot)
+        manager = pywrapcp.RoutingIndexManager(n, n_vehicles, depot)
         routing = pywrapcp.RoutingModel(manager)
 
         # 重みを整数化（内部コスト単位: [秒 × WEIGHT_SCALE]）
@@ -552,25 +632,38 @@ class ORToolsSolver(SolverBase):
         cost_idx = routing.RegisterTransitCallback(cost_cb)
         routing.SetArcCostEvaluatorOfAllVehicles(cost_idx)
 
-        # M Σ z_q: 使用した判定士 1 人ごとの固定費（人数の最小化）
+        # M Σ z: 使用した判定士 1 人日ごとの固定費（人数・日数の最小化）。
+        # 複数日計画では「使う人日」が最小化され、日ごとの使用人数が減る
         routing.SetFixedCostOfAllVehicles(m_int)
 
-        # 稼働時間制約: 各判定士の累積時間（移動+判定+帰還）≤ max_work_sec
-        routing.AddDimension(transit_idx, 0, max_work_sec, True, "Time")
+        # 稼働時間制約: 各判定士・各日の累積時間 ≤ その日の開始 + max_work_sec。
+        # 車両 v の日 = v // m。開始時刻を日オフセット (86400×日) に固定し、
+        # 終了時刻の上限を日オフセット + max_work_sec とすることで
+        # 「毎日 max_work_h まで働く」を表現する
+        horizon = (n_days - 1) * DAY_SEC + max_work_sec
+        routing.AddDimension(transit_idx, 0, horizon, n_days == 1, "Time")
         time_dim = routing.GetDimensionOrDie("Time")
+        if n_days > 1:
+            for v in range(n_vehicles):
+                off = (v // m) * DAY_SEC
+                time_dim.CumulVar(routing.Start(v)).SetRange(off, off)
+                time_dim.CumulVar(routing.End(v)).SetRange(
+                    off, off + max_work_sec)
 
         # μ Σ p_i a_i: 優先建物の判定開始時刻（= Time 次元の累積値）にコスト。
-        # 上限 0 の soft 制約なので「超過分 = a_i そのもの」に係数がかかる
+        # 上限 0 の soft 制約なので「超過分 = a_i そのもの」に係数がかかる。
+        # 複数日では日オフセットが乗るため「後の日ほど高コスト」になり、
+        # 優先建物は自然と初日の早い時間帯に組み込まれる
         for node in range(n):
             if node != depot and mu_int[node] > 0:
                 time_dim.SetCumulVarSoftUpperBound(
                     manager.NodeToIndex(node), 0, int(mu_int[node]))
 
         # 未割当の許容: 大きなペナルティ付きで建物をドロップ可能にする
-        # （時間的に全棟不可能な場合でも解が返るようにする）。
+        # （期日内に全棟不可能な場合でも解が返るようにする）。
         # ペナルティは「1 棟ドロップで節約できる最大コスト」を確実に上回る値
         max_mu = int(mu_int.max()) if len(mu_int) else 0
-        drop_penalty = (m_int + (lam_int + max_mu) * max_work_sec) * 10
+        drop_penalty = (m_int + (lam_int + max_mu) * horizon) * 10
         for node in range(n):
             if node != depot:
                 routing.AddDisjunction([manager.NodeToIndex(node)], drop_penalty)
@@ -585,9 +678,14 @@ class ORToolsSolver(SolverBase):
 
         assignment = None
         if initial is not None and initial.routes:
-            # 貪欲解を初期解として渡す（デポ端点と未割当は除く）
-            init_routes = [r[1:-1] for r in initial.routes][:m]
-            init_routes += [[] for _ in range(m - len(init_routes))]
+            # 貪欲解を初期解として渡す（デポ端点と未割当は除く）。
+            # 車両インデックスは「日 × m + 判定士 ID」の順に対応させる
+            init_routes = [[] for _ in range(n_vehicles)]
+            for day, insp, r in zip(initial.route_day,
+                                    initial.route_inspector, initial.routes):
+                v = day * m + insp
+                if 0 <= v < n_vehicles:
+                    init_routes[v] = r[1:-1]
             routing.CloseModelWithParameters(params)
             init_assignment = routing.ReadAssignmentFromRoutes(init_routes, True)
             if init_assignment is not None:
@@ -598,9 +696,9 @@ class ORToolsSolver(SolverBase):
         if assignment is None:
             raise RuntimeError("OR-Tools が解を見つけられませんでした")
 
-        # 解の取り出し
-        routes = []
-        for v in range(m):
+        # 解の取り出し（車両 v = 日 v//m の判定士 v%m の 1 日分ルート）
+        routes, route_days, route_inspectors = [], [], []
+        for v in range(n_vehicles):
             idx = routing.Start(v)
             route = []
             while not routing.IsEnd(idx):
@@ -608,6 +706,8 @@ class ORToolsSolver(SolverBase):
                 idx = assignment.Value(routing.NextVar(idx))
             route.append(manager.IndexToNode(idx))   # 終端 = デポ
             routes.append(route)
+            route_days.append(v // m)
+            route_inspectors.append(v % m)
 
         unassigned = [
             node for node in range(n)
@@ -616,7 +716,8 @@ class ORToolsSolver(SolverBase):
                 routing.NextVar(manager.NodeToIndex(node)))
                 == manager.NodeToIndex(node)
         ]
-        return InspectionSolution(problem, routes, unassigned)
+        return InspectionSolution(problem, routes, unassigned,
+                                  route_days, route_inspectors)
 
 
 # ── 最小判定士数の探索 ────────────────────────────────────────────────────────

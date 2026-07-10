@@ -137,6 +137,7 @@ class TSPApp:
         self._row(ctrl, "判定士数 m:",        "m_var",       "4",              6)
         self._row(ctrl, "移動速度 (km/h):",   "speed_var",  "30",              6)
         self._row(ctrl, "最大稼働時間 (h):",  "maxwork_var", "8",              6)
+        self._row(ctrl, "期日 (日):",         "days_var",    "1",              6)
         self._row(ctrl, "並列試行回数:",      "starts_var",  str(self.n_cpu),  6)
         self._row(ctrl, "並列数:",            "workers_var", str(self.n_cpu),  6)
         tk.Label(ctrl,
@@ -305,10 +306,10 @@ class TSPApp:
         self.stat_dist.config(text="総移動距離: -")
         self.stat_time.config(text="計算時間: -")
         self.stat_status.config(text="状態: 待機中")
-        self._update_per_text([])
+        self._update_per_text(None)
 
     def _make_problem(self, nodes, inspect_times, depot_idx,
-                      area_km, speed, max_work, priorities=None):
+                      area_km, speed, max_work, priorities=None, n_days=1):
         """GUI 入力値から InspectionProblem を構築する"""
         return InspectionProblem(
             coords=np.array(nodes, dtype=np.float64),
@@ -318,7 +319,8 @@ class TSPApp:
             speed_kmh=speed,
             max_work_h=max_work,
             priorities=(np.array(priorities, dtype=np.float64)
-                        if priorities else None))
+                        if priorities else None),
+            n_days=n_days)
 
     def calc_min_m(self):
         """全棟割当可能な最小判定士数を二分探索で求める（mtsp_core に委譲）"""
@@ -331,30 +333,32 @@ class TSPApp:
             speed    = float(self.speed_var.get());    assert speed > 0
             max_work = float(self.maxwork_var.get());  assert max_work > 0
             area_km  = float(self.area_var.get());     assert area_km > 0
+            n_days   = int(self.days_var.get());       assert 1 <= n_days <= 365
         except Exception:
-            messagebox.showerror("エラー", "移動速度・最大稼働時間・エリアを確認してください")
+            messagebox.showerror("エラー", "移動速度・最大稼働時間・エリア・期日を確認してください")
             return
 
         self.solving = True
         self.solve_btn.config(state=tk.DISABLED)
         self.min_m_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
-        self.stat_status.config(text="状態: 最小判定士数を探索中...")
+        self.stat_status.config(text=f"状態: 最小判定士数を探索中...（期日 {n_days} 日）")
         self.progress.start(10)
 
         threading.Thread(
             target=self._min_m_worker,
             args=(list(self.nodes), list(self.inspect_times),
-                  speed, max_work, area_km),
+                  list(self.priorities), speed, max_work, area_km, n_days),
             daemon=True).start()
 
-    def _min_m_worker(self, nodes, inspect_times, speed, max_work, area_km):
+    def _min_m_worker(self, nodes, inspect_times, priorities,
+                      speed, max_work, area_km, n_days):
         """二分探索のバックグラウンドスレッド本体"""
         t0 = time.perf_counter()
         try:
             problem = self._make_problem(
                 nodes, inspect_times, self._auto_depot(),
-                area_km, speed, max_work)
+                area_km, speed, max_work, priorities, n_days)
             min_m, sol = find_min_inspectors(
                 problem, GreedySolver(),
                 progress=lambda mid: self.root.after(
@@ -394,7 +398,7 @@ class TSPApp:
                                       fg="#2e7d32")
             self.stat_dist.config(text=f"総移動距離: {sol.total_dist:.1f} km")
             self.stat_m.config(text=f"判定士数: {min_m} (最小)")
-            self._update_per_text(sol.per_time, sol.per_dist)
+            self._update_per_text(sol)
             self._redraw()
 
         self.stat_status.config(
@@ -475,13 +479,19 @@ class TSPApp:
 
         coords = np.array(self.nodes)
 
-        # 判定士ごとのルートを色分けして描画
+        # ルートを描画（色 = 判定士、線種 = 日: 1日目実線・2日目破線・…）
         if self.solution:
-            for s, route in enumerate(self.solution.routes):
-                color = COLORS[s % len(COLORS)]
+            linestyles = ["-", "--", ":", "-."]
+            for route, insp, day in zip(self.solution.routes,
+                                        self.solution.route_inspector,
+                                        self.solution.route_day):
+                if len(route) <= 2:
+                    continue
+                color = COLORS[insp % len(COLORS)]
                 rc    = coords[route]
                 lw    = max(0.4, 1.4 - n / 25000)
-                self.ax.plot(rc[:, 0], rc[:, 1], "-",
+                self.ax.plot(rc[:, 0], rc[:, 1],
+                             linestyle=linestyles[day % len(linestyles)],
                              color=color, linewidth=lw, alpha=0.75, zorder=2)
 
         # 建物を判定時間のヒートマップで描画（黄→赤: 短い→長い）
@@ -544,18 +554,25 @@ class TSPApp:
 
         self.canvas.draw_idle()
 
-    def _update_per_text(self, per_time, per_dist=None):
-        """判定士ごとの稼働時間・移動距離テーブルを更新する"""
+    def _update_per_text(self, sol=None):
+        """判定士（×日）ごとの稼働時間・移動距離テーブルを更新する"""
         self.per_text.config(state=tk.NORMAL)
         self.per_text.delete("1.0", tk.END)
-        if per_time:
+        if sol is not None and sol.routes:
+            multi = sol.problem.n_days > 1
+            head = "担当者(日)" if multi else "担当者"
             self.per_text.insert(
-                tk.END, f"{'担当者':>5}  {'稼働時間(h)':>11}  {'移動距離(km)':>12}\n")
-            self.per_text.insert(tk.END, "-" * 34 + "\n")
-            for i, t in enumerate(per_time):
-                d_str = f"{per_dist[i]:>12.2f}" if per_dist else ""
+                tk.END, f"{head:>7}  {'稼働時間(h)':>11}  {'移動距離(km)':>12}\n")
+            self.per_text.insert(tk.END, "-" * 38 + "\n")
+            for route, insp, day, t, d in zip(
+                    sol.routes, sol.route_inspector, sol.route_day,
+                    sol.per_time, sol.per_dist):
+                if multi and len(route) <= 2:
+                    continue   # 複数日では空ルート（休み）は表示しない
+                label = (f"#{insp+1:2d} {day+1}日" if multi
+                         else f"#{insp+1:2d}")
                 self.per_text.insert(
-                    tk.END, f"  #{i+1:2d}   {t:>11.3f}  {d_str}\n")
+                    tk.END, f"  {label:<8} {t:>11.3f}  {d:>12.2f}\n")
         self.per_text.config(state=tk.DISABLED)
 
     # ── サマリー ─────────────────────────────────────────────────────────────
@@ -594,14 +611,17 @@ class TSPApp:
                       if prio_done > 0 else None)
         all_mean   = (float(np.nanmean(a)) if n_inspected > 0 else None)
 
-        # 所要日数の推定: この計画を 1 日分として、同じペースで
-        # 全棟を検査し終えるまでの日数（未割当ゼロなら 1 日）
+        # 所要日数: 期日 n_days 日の計画に対する実際の使用日数と、
+        # 未割当が残る場合は現在のペースでの必要日数の推定
         if n_unassign == 0:
-            days_txt = "1 日で全棟完了"
+            days_txt = (f"{sol.n_days_used} 日で全棟完了"
+                        f"（期日 {p.n_days} 日以内）")
         elif n_inspected > 0:
-            est_days = int(np.ceil(n_total / n_inspected))
-            days_txt = (f"約 {est_days} 日 "
-                        f"(1日 {n_inspected:,} 棟のペースで全 {n_total:,} 棟)")
+            pace = n_inspected / max(1, sol.n_days_used)
+            est_days = int(np.ceil(n_total / pace))
+            days_txt = (f"期日 {p.n_days} 日では {n_unassign:,} 棟が未完了。"
+                        f"全棟には約 {est_days} 日必要"
+                        f"（1日約 {pace:,.0f} 棟のペース）")
         else:
             days_txt = "算出不可（検査済み 0 棟）"
 
@@ -636,14 +656,28 @@ class TSPApp:
             "",
             "■ 体制・時間",
             f"  判定士              : 使用 {sol.n_used} 人 / 上限 {sol.n_inspectors} 人",
-            f"  最大終了時間        : {self._fmt_hm(sol.makespan)}"
-            f"（稼働上限 {p.max_work_h:g} h）",
+            f"  期日 / 使用日数     : {p.n_days} 日 / {sol.n_days_used} 日"
+            f"（延べ {sol.person_days} 人日）",
+            f"  1日の最大稼働       : {self._fmt_hm(sol.makespan)}"
+            f"（上限 {p.max_work_h:g} h）",
             f"  総活動時間 ΣT_q     : {sol.total_time:.2f} h",
-            f"  平均稼働時間        : {avg_t:.2f} h/人",
+            f"  平均稼働時間        : {avg_t:.2f} h/人日",
             f"  総移動距離          : {sol.total_dist:.1f} km"
             f"（平均 {avg_d:.1f} km/人）",
+        ]
+        # 複数日計画では日ごとの内訳を表示
+        if p.n_days > 1:
+            lines.append("  日別内訳:")
+            for d in range(sol.n_days_used):
+                cnt = sum(len(r) - 2 for r, rd in
+                          zip(sol.routes, sol.route_day)
+                          if rd == d and len(r) > 2)
+                ppl = sum(1 for r, rd in zip(sol.routes, sol.route_day)
+                          if rd == d and len(r) > 2)
+                lines.append(f"    {d+1} 日目: {ppl:2d} 人で {cnt:,} 棟")
+        lines += [
             "",
-            "■ 所要日数（推定）",
+            "■ 所要日数",
             f"  {days_txt}",
             "",
             "■ コスト（目的関数）  min MΣz + λΣT + μΣp·a",
@@ -681,6 +715,7 @@ class TSPApp:
             speed     = float(self.speed_var.get());    assert speed > 0
             max_work  = float(self.maxwork_var.get());  assert max_work > 0
             area_km   = float(self.area_var.get());     assert area_km > 0
+            n_days    = int(self.days_var.get());       assert 1 <= n_days <= 365
             n_workers = max(1, int(self.workers_var.get()))
             n_starts  = max(1, int(self.starts_var.get()))
             time_limit = float(self.limit_var.get()); assert time_limit > 0
@@ -724,12 +759,12 @@ class TSPApp:
             target=self._solve_worker,
             args=(list(self.nodes), list(self.inspect_times),
                   list(self.priorities),
-                  m, speed, max_work, area_km, n_workers, depots,
+                  m, speed, max_work, area_km, n_days, n_workers, depots,
                   use_ortools, time_limit, (w_m, w_l, w_p)),
             daemon=True).start()
 
     def _solve_worker(self, nodes, inspect_times, priorities, m, speed,
-                      max_work, area_km, n_workers, depots,
+                      max_work, area_km, n_days, n_workers, depots,
                       use_ortools, time_limit, weights):
         """ソルバーのバックグラウンドスレッド本体（mtsp_core に委譲）"""
         t0 = time.perf_counter()
@@ -737,7 +772,7 @@ class TSPApp:
         try:
             problem = self._make_problem(
                 nodes, inspect_times, depots[0], area_km, speed, max_work,
-                priorities)
+                priorities, n_days)
             # まず貪欲法（マルチスタート）で構築解を得る
             solver = MultiStartSolver(depot_candidates=depots,
                                       n_workers=n_workers)
@@ -799,7 +834,7 @@ class TSPApp:
         self.stat_time.config(text=f"計算時間: {elapsed:.3f} 秒")
         self.stat_status.config(
             text=f"状態: 完了 — {note}" if note else "状態: 完了")
-        self._update_per_text(sol.per_time, sol.per_dist)
+        self._update_per_text(sol)
         self._redraw()
 
     # ── ベンチマーク ─────────────────────────────────────────────────────────
